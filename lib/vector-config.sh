@@ -79,6 +79,23 @@ start_pattern     = '^\\S'
 condition_pattern = '^\\s'
 mode              = "continue_through"
 timeout_ms        = 1000
+
+# Identify files by inode, not by a checksum of their first line.
+#
+# Vector's default fingerprint is a checksum over lines = 1. Sibling PM2 logs
+# routinely share a first line — the same framework banner in prod, stage and
+# qa, or nothing at all in a file that has not been written to yet — so they
+# collide. Vector then decides they are one file that keeps being renamed,
+# watches only the most recently modified of the group, and attributes its lines
+# to whichever name it settled on. That silently drops most services and files
+# the rest under the wrong one, which is worse than collecting nothing: the
+# dashboard looks healthy and is lying.
+#
+# The trade-off is inode reuse after deletion, which is rare and self-corrects
+# at the next rotation. Collisions here are not rare; they are happening on
+# every machine with more than one environment deployed.
+[sources.pm2.fingerprint]
+strategy = "device_and_inode"
 EOF
     fi
 
@@ -112,6 +129,11 @@ type = "file"
 include = [ "$NGINX_LOG_DIR/*.log" ]
 read_from = "end"
 ignore_older_secs = 86400
+
+# Same reason as the PM2 source: access.log and error.log for several vhosts
+# share opening lines and would be fingerprinted as one file.
+[sources.nginx.fingerprint]
+strategy = "device_and_inode"
 EOF
     fi
 

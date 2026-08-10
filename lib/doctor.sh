@@ -54,6 +54,10 @@ if [ -f "$CONF" ]; then
   DAYS=$(json_get "$CONF" days 0)
   SERVICES=$(json_get "$CONF" logServices '[]')
   info "retention      $DAYS day(s)"
+  # Which SOURCES are on, not just which services. A source switched off in the
+  # app is indistinguishable from a broken one once the config is generated —
+  # the section simply is not there.
+  info "sources        $(json_get "$CONF" sources '{}')"
   info "services       $SERVICES"
   if [ "$PAUSED" = "true" ]; then
     bad "paused — nothing will be collected until retention and services are set"
@@ -96,8 +100,14 @@ fi
 head_ "collector config"
 if [ -f "$VECTOR_CONF" ]; then
   ok "config         $VECTOR_CONF ($(wc -l < "$VECTOR_CONF") lines, written $(date -r "$VECTOR_CONF" '+%Y-%m-%d %H:%M' 2>/dev/null))"
-  info "sources        $(grep -c '^\[sources\.' "$VECTOR_CONF" 2>/dev/null) declared"
-  grep -o "^\[sources\.[a-z0-9_]*\]" "$VECTOR_CONF" 2>/dev/null | sed 's/^/                 /'
+  # Top-level source tables only. Counting every line starting with
+  # "[sources." also counted [sources.pm2.multiline] and
+  # [sources.pm2.fingerprint], so the report claimed three sources and then
+  # listed two — which reads as a bug in the listing rather than what it was:
+  # the count was wrong.
+  SRC_LIST=$(grep -oE '^\[sources\.[a-z0-9_]+\]$' "$VECTOR_CONF" 2>/dev/null)
+  info "sources        $(printf '%s\n' "$SRC_LIST" | grep -c . ) collecting"
+  printf '%s\n' "$SRC_LIST" | sed 's/^/                 /'
 
   # Re-validate live. A config that was accepted at generate time can still be
   # rejected by a Vector that has since been upgraded, and that is invisible
