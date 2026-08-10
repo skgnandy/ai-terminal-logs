@@ -220,13 +220,25 @@ else
   SINCE_ARG=$(date -d "$SINCE" +@%s 2>/dev/null) || SINCE_ARG="$SINCE"
   [ -n "$SINCE_ARG" ] || SINCE_ARG="$SINCE"
 
-  V_ERRS=$(journalctl -u vector --no-pager -o cat --since "$SINCE_ARG" 2>/dev/null \
-    | grep -E 'ERROR|error\[E[0-9]+\]|panicked' | head -25)
+  V_JOURNAL=$(journalctl -u vector --no-pager -o cat --since "$SINCE_ARG" 2>/dev/null)
+
+  V_ERRS=$(printf '%s\n' "$V_JOURNAL" | grep -E 'ERROR|error\[E[0-9]+\]|panicked' | head -25)
   if [ -n "$V_ERRS" ]; then
     bad "the running collector is logging errors:"
     printf '%s\n' "$V_ERRS" | sed 's/^/          /'
   else
-    ok "none since $SINCE"
+    ok "no errors since $SINCE"
+  fi
+
+  # Warnings reported separately and NOT counted as problems. A VRL warning does
+  # not stop the collector, so failing the verdict on one would train people to
+  # ignore the verdict. But it is still a mistaken assumption in the config, and
+  # the previous grep matched only "error[E...]" — so a warning[E620] sat in
+  # plain sight two lines under "no problems found".
+  V_WARNS=$(printf '%s\n' "$V_JOURNAL" | grep -E 'warning\[E[0-9]+\]' | head -10)
+  if [ -n "$V_WARNS" ]; then
+    info "config warnings (collector runs, but the config asserts something untrue):"
+    printf '%s\n' "$V_WARNS" | sed 's/^/          /'
   fi
 fi
 

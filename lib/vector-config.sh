@@ -189,11 +189,14 @@ source = '''
     # config — which leaves the collector stopped rather than degraded.
     tail = parse_regex(path, r'(?P<b>[^/]+)$') ?? null
     base = if tail != null { string!(tail.b) } else { path }
+    # No string!() on base: both branches above yield a string, so the assertion
+    # can never fire and VRL warns E620 "can't abort infallible function" on
+    # every config load.
     if starts_with(path, "/var/log/nginx") {
-      .service = replace(string!(base), ".log", "")
+      .service = replace(base, ".log", "")
       .kind = "nginx"
     } else {
-      .service = replace(string!(base), r'-(out|error)(-\d+)?\.log$', "")
+      .service = replace(base, r'-(out|error)(-\d+)?\.log$', "")
       .kind = "pm2"
       .stream = if match(path, r'-error') { "stderr" } else { "stdout" }
     }
