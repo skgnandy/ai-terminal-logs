@@ -1,0 +1,26 @@
+[Unit]
+Description=ai-terminal log receiver (Vector -> Postgres COPY)
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ai-terminal/env
+ExecStart=/usr/bin/env python3 /opt/ai-terminal-logs/lib/receiver.py
+Restart=always
+RestartSec=5
+
+# Hard ceiling. The receiver queue sheds load rather than growing, but a memory
+# limit is the backstop that guarantees the agent can never OOM the machine it
+# is monitoring.
+MemoryMax=256M
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/ai-terminal /var/lib/ai-terminal
+
+[Install]
+WantedBy=multi-user.target

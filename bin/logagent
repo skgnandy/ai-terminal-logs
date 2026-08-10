@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+#
+# logagent — control surface for the ai-terminal log agent.
+#
+# Every action the app performs over SSH maps to one subcommand here. Output of
+# `status` is JSON so the app can parse it directly; everything else is quiet.
+#
+#   logagent status
+#   logagent set --json '{"days":7,"logServices":["api"]}' [--purge]
+#   logagent pause | resume
+#   logagent notify "message" ['{"host":"h","service":"s"}']
+#   logagent channels --json '{"telegram":{"token":"…","chatId":"…"}}'
+#   logagent uninstall --yes
+
+set -euo pipefail
+. /opt/ai-terminal-logs/lib/common.sh
+load_env
+
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_status() {
+  python3 - "$CONF" <<'PY'
+import json, os, shutil, subprocess, sys
+
+conf_path = sys.argv[1]
+try:
+    conf = json.load(open(conf_path))
+except Exception:
+    conf = {}
+
+container = os.environ.get("PG_CONTAINER", "ai-terminal-logs")
+pg_user = os.environ.get("PG_USER", "logagent")
+pg_db = os.environ.get("PG_DB", "logs")
+
+
+def sh(cmd: str) -> str:
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True,
+                              text=True, timeout=25).stdout.strip()
+    except Exception:
+        return ""
+
+
+def q(sql: str) -> str:
+    return sh(f'docker exec -i {container} psql -U {pg_user} -d {pg_db} -qtAX -c "{sql}"')
+
+
+def qi(sql: str, default: int = 0) -> int:
+    try:
+        return int(q(sql) or default)
+    except ValueError:
+        return default
+
+
+# Discovery: what this machine could collect, whether or not it is selected.
+discovered = []
+pm2_raw = sh("pm2 jlist 2>/dev/null")
+if pm2_raw:
+    try:
+        for p in json.loads(pm2_raw):
+            env = p.get("pm2_env") or {}
+            discovered.append({
+                "name": p.get("name"),
+                "kind": "pm2",
+                "status": env.get("status"),
+                "restarts": env.get("restart_time", 0),
+            })
+    except Exception:
+        pass
+
+for line in sh("docker ps --format '{{.Names}}|{{.Status}}'").splitlines():
+    if "|" not in line:
+        continue
+    name, status = line.split("|", 1)
+    if name == container:
+        continue
+    discovered.append({
+        "name": name,
+        "kind": "docker",
+        "status": "unhealthy" if "unhealthy" in status else "running",
+    })
+
+selected = conf.get("logServices") or []
+for item in discovered:
+    item["enabled"] = item["name"] in selected
+
+usage = shutil.disk_usage("/")
+db_running = container in sh("docker ps --format '{{.Names}}'").splitlines()
+
+print(json.dumps({
+    "installed": True,
+    "version": open("/opt/ai-terminal-logs/VERSION").read().strip()
+               if os.path.exists("/opt/ai-terminal-logs/VERSION") else "unknown",
+    "schemaVersion": qi("SELECT max(version) FROM schema_version;") if db_running else 0,
+    "paused": conf.get("paused", True),
+    "days": conf.get("days"),
+    "timezone": os.environ.get("TZ_NAME", "UTC"),
+    "dbPort": int(os.environ.get("PG_PORT", 0) or 0),
+    "sources": conf.get("sources", {}),
+    "logServices": selected,
+    "metricsAll": True,
+    "discovered": discovered,
+    "health": {
+        "database": db_running,
+        "vector": sh("systemctl is-active vector") == "active",
+        "receiver": sh("systemctl is-active ai-terminal-receiver") == "active",
+        "partitionTimer": sh("systemctl is-active ai-terminal-partitions.timer") == "active",
+        "clockSynced": sh("timedatectl show -p NTPSynchronized --value") == "yes",
+    },
+    "maintenance": {
+        "lastCleanup": q("SELECT max(ts) FROM maintenance_log WHERE action='drop_partition';") or None,
+        "partitionsThrough": q(
+            "SELECT max(c.relname) FROM pg_class c "
+            "JOIN pg_inherits i ON i.inhrelid=c.oid "
+            "JOIN pg_class p ON p.oid=i.inhparent WHERE p.relname='log_entries';") or None,
+        "recent": [r for r in q(
+            "SELECT ts||' '||action||' '||coalesce(detail,'') FROM maintenance_log "
+            "ORDER BY ts DESC LIMIT 5;").splitlines() if r],
+    },
+    "stats": {
+        "rows": qi("SELECT count(*) FROM log_entries;"),
+        "dbBytes": qi("SELECT pg_database_size(current_database());"),
+        "oldestRow": q("SELECT min(ts) FROM log_entries;") or None,
+        "newestRow": q("SELECT max(ts) FROM log_entries;") or None,
+        "freeDisk": usage.free,
+        "totalDisk": usage.total,
+    },
+}))
+PY
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_set() {
+  local patch="${1:-{\}}" purge="${2:-}" prev_days new_days
+
+  prev_days=$(json_get "$CONF" days 0)
+
+  python3 - "$CONF" "$patch" <<'PY'
+import json, sys
+path, patch = sys.argv[1], sys.argv[2]
+conf = json.load(open(path))
+for key, value in json.loads(patch).items():
+    if key == "sources" and isinstance(value, dict):
+        conf.setdefault("sources", {}).update(value)
+    else:
+        conf[key] = value
+# Choosing retention is the act of configuring the agent, so it also unpauses.
+if conf.get("days") and conf.get("logServices"):
+    conf["paused"] = False
+json.dump(conf, open(path, "w"), indent=2)
+PY
+  chmod 600 "$CONF"
+
+  new_days=$(json_get "$CONF" days 0)
+
+  if [ "$purge" = "--purge" ]; then
+    pgq -c "TRUNCATE log_entries;" >/dev/null 2>&1 || true
+    audit purge "operator requested"
+  fi
+
+  # Retention changes take effect NOW, not on the next timer run — a user who
+  # lowers retention to reclaim disk expects the disk back immediately.
+  if [ "$prev_days" != "$new_days" ]; then
+    bash "$LIB_DIR/partitions.sh" >/dev/null 2>&1 || true
+  fi
+
+  bash "$LIB_DIR/vector-config.sh" >/dev/null 2>&1 || warn "vector config regeneration failed"
+  cmd_status
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_channels() {
+  local patch="${1:-{\}}"
+  install -d -m 700 "$ETC"
+  [ -f "$CHANNELS" ] || echo '{}' > "$CHANNELS"
+
+  python3 - "$CHANNELS" "$patch" <<'PY'
+import json, sys
+path, patch = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path))
+for key, value in json.loads(patch).items():
+    if isinstance(value, dict):
+        cfg.setdefault(key, {}).update(value)
+    else:
+        cfg[key] = value
+json.dump(cfg, open(path, "w"), indent=2)
+PY
+  chmod 600 "$CHANNELS"
+  echo '{"ok":true}'
+}
+
+cmd_pause() {
+  systemctl stop vector >/dev/null 2>&1 || true
+  python3 -c "
+import json,sys
+p=sys.argv[1]; c=json.load(open(p)); c['paused']=True
+json.dump(c, open(p,'w'), indent=2)" "$CONF"
+  audit paused "operator requested"
+  echo '{"paused":true}'
+}
+
+cmd_resume() {
+  python3 -c "
+import json,sys
+p=sys.argv[1]; c=json.load(open(p)); c['paused']=False
+json.dump(c, open(p,'w'), indent=2)" "$CONF"
+  systemctl start vector >/dev/null 2>&1 || warn "vector failed to start"
+  audit resumed "operator requested"
+  echo '{"paused":false}'
+}
+
+cmd_uninstall() {
+  [ "${1:-}" = "--yes" ] || die "refusing without --yes"
+
+  local freed
+  freed=$(pgq -c "SELECT pg_database_size(current_database());" 2>/dev/null || echo 0)
+
+  systemctl disable --now vector ai-terminal-receiver \
+    ai-terminal-partitions.timer ai-terminal-watchdog.timer \
+    ai-terminal-metrics.timer >/dev/null 2>&1 || true
+
+  docker rm -f "$PG_CONTAINER"   >/dev/null 2>&1 || true
+  docker volume rm "$PG_VOLUME"  >/dev/null 2>&1 || true
+
+  rm -f /etc/systemd/system/ai-terminal-*.service /etc/systemd/system/ai-terminal-*.timer
+  rm -f "$VECTOR_CONF"
+  rm -rf "$STATE" /opt/ai-terminal-logs
+
+  # Credentials last and unconditionally. Leaving FCM keys, SMTP passwords or the
+  # database password behind is the worst possible outcome of an uninstall.
+  rm -rf "$ETC"
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/logagent
+
+  echo "{\"uninstalled\":true,\"freedBytes\":${freed:-0}}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+case "${1:-status}" in
+  status)    cmd_status ;;
+  set)       shift; [ "${1:-}" = "--json" ] && shift; cmd_set "${1:-}" "${2:-}" ;;
+  channels)  shift; [ "${1:-}" = "--json" ] && shift; cmd_channels "${1:-}" ;;
+  notify)    shift; python3 "$LIB_DIR/notify.py" "${1:-test}" "${2:-{\}}" ;;
+  pause)     cmd_pause ;;
+  resume)    cmd_resume ;;
+  reload)    bash "$LIB_DIR/vector-config.sh" ;;
+  maintain)  bash "$LIB_DIR/partitions.sh" ;;
+  uninstall) shift; cmd_uninstall "${1:-}" ;;
+  version)   cat /opt/ai-terminal-logs/VERSION 2>/dev/null || echo unknown ;;
+  *)
+    cat >&2 <<'USAGE'
+usage: logagent <command>
+
+  status                        JSON: config, discovered services, health, stats
+  set --json '<patch>' [--purge]  merge config; retention changes apply immediately
+  channels --json '<patch>'     configure fcm / telegram / smtp
+  notify "<message>" ['<data>'] send a test alert through every channel
+  pause | resume                stop or start collection (data retained)
+  reload                        regenerate vector config
+  maintain                      run partition maintenance now
+  uninstall --yes               remove everything, credentials included
+  version
+USAGE
+    exit 1
+    ;;
+esac

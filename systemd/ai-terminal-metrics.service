@@ -1,0 +1,10 @@
+[Unit]
+Description=ai-terminal metrics collection (PM2, Docker, host)
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ai-terminal/env
+ExecStart=/bin/bash /opt/ai-terminal-logs/lib/metrics.sh

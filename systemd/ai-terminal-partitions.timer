@@ -1,0 +1,15 @@
+[Unit]
+Description=ai-terminal partition maintenance (daily)
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+
+[Timer]
+OnCalendar=*-*-* 00:10:00
+RandomizedDelaySec=300
+
+# Persistent, deliberately. A run missed while the machine was off executes at
+# next boot. A silently skipped run would leave a day with no partition, and
+# every insert for that day would fail.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

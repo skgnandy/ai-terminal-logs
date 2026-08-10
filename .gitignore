@@ -1,0 +1,9 @@
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.pyc
