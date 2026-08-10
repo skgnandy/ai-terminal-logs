@@ -62,7 +62,9 @@ say "installing to $PREFIX"
 rm -rf "$PREFIX.new"
 mkdir -p "$PREFIX.new"
 cp -r "$SRC/lib" "$SRC/bin" "$SRC/sql" "$SRC/systemd" "$PREFIX.new/"
-[ -f "$SRC/VERSION" ] && cp "$SRC/VERSION" "$PREFIX.new/"
+# `|| true` matters under `set -e`: a failed test would otherwise abort the
+# install rather than simply skipping an optional file.
+[ -f "$SRC/VERSION" ] && cp "$SRC/VERSION" "$PREFIX.new/" || true
 chmod +x "$PREFIX.new"/lib/*.sh "$PREFIX.new"/bin/* 2>/dev/null || true
 
 rm -rf "$PREFIX.old"
