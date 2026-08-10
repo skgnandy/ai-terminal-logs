@@ -1,0 +1,11 @@
+[Unit]
+Description=ai-terminal alert evaluation
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ai-terminal/env
+ExecStart=/usr/bin/env python3 /opt/ai-terminal-logs/lib/alerts.py
+TimeoutStartSec=120

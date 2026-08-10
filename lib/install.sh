@@ -119,10 +119,15 @@ systemctl enable --now ai-terminal-receiver.service >/dev/null 2>&1 \
 systemctl enable --now ai-terminal-partitions.timer >/dev/null 2>&1 || true
 systemctl enable --now ai-terminal-watchdog.timer   >/dev/null 2>&1 || true
 systemctl enable --now ai-terminal-metrics.timer    >/dev/null 2>&1 || true
+systemctl enable --now ai-terminal-rollup.timer     >/dev/null 2>&1 || true
+systemctl enable --now ai-terminal-alerts.timer     >/dev/null 2>&1 || true
+systemctl enable --now ai-terminal-probes.timer     >/dev/null 2>&1 || true
 
 # ── 7. first partitions + vector config ──────────────────────────────────────
 bash "$PREFIX/lib/partitions.sh" >/dev/null 2>&1 || warn "initial partition creation failed"
 bash "$PREFIX/lib/vector-config.sh" >/dev/null 2>&1 || warn "initial vector config generation failed"
+# Seed the rollup so the dashboard is not blank the first time it is opened.
+bash "$PREFIX/lib/rollup.sh" >/dev/null 2>&1 || true
 
 # Paused until configured — vector must not start yet.
 systemctl stop vector >/dev/null 2>&1 || true

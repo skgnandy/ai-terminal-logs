@@ -1,0 +1,11 @@
+[Unit]
+Description=ai-terminal active probes (every 10 minutes)
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=60s
+
+[Install]
+WantedBy=timers.target

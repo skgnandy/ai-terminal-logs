@@ -1,0 +1,11 @@
+[Unit]
+Description=ai-terminal rollup (every 5 minutes)
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

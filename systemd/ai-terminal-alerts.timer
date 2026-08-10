@@ -1,0 +1,11 @@
+[Unit]
+Description=ai-terminal alert evaluation (every 60 seconds)
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

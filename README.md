@@ -62,6 +62,19 @@ its own — you only choose whether to *store* its logs.
 **No Docker restart is required.** The `docker_logs` source reads the socket directly,
 so your production database containers are never touched.
 
+Beyond logs, four background jobs collect what a log line never reports:
+
+| Job | Every | Produces |
+|---|---|---|
+| **metrics** | 60 s | CPU, memory, restarts, status — for *every* service, selected or not |
+| **rollup** | 5 min | 5-minute buckets with **p50/p95/p99 latency**, plus errors grouped by fingerprint |
+| **alerts** | 60 s | evaluates every rule, notifies on state *transitions* only |
+| **probes** | 10 min | Postgres/Redis/Mongo internals, TLS certificate expiry |
+
+Latency percentiles come from `attrs.duration_ms`, which the parser extracts from HTTP
+access lines — so **p95 per service works without tracing**. What still needs spans is
+*which layer* was slow.
+
 ---
 
 ## Architecture
@@ -75,7 +88,8 @@ so your production database containers are never touched.
 │   nginx files ──┘                            (container)     │
 │                                                              │
 │   systemd timers:  partitions (daily) · watchdog (5 min)     │
-│                    metrics (60 s)                            │
+│                    metrics (60 s)  · alerts (60 s)           │
+│                    rollup (5 min)  · probes (10 min)         │
 └──────────────────────────────────────────────────────────────┘
                               ▲
                               │  SSH tunnel — Postgres is loopback-only
@@ -168,7 +182,29 @@ logagent pause                                      # stop collecting, keep data
 logagent resume
 logagent notify "test message"                      # verify alert channels
 logagent uninstall --yes                            # removes everything, credentials included
+
+logagent alerts list                                # rules, thresholds, what is firing
+logagent alerts firing                              # currently firing, with since-time
+logagent alerts coverage                            # which rules apply to which service
+logagent alerts events 50                           # alert history
+logagent alerts set 1 '{"threshold":50}'            # tune a rule
+logagent alerts silence 3 120                       # mute rule 3 for 120 minutes
+
+logagent errors list                                # errors grouped by fingerprint
+logagent errors state <fp> ignored                  # triage: open | ignored | resolved
+
+logagent probe                                      # run DB + certificate probes now
+logagent rollup                                     # recompute rollups now
 ```
+
+`alerts coverage` exists because coverage is uneven and that must be visible: metric
+rules (crash loop, service down, unhealthy, disk, CPU, memory, certificates) apply to
+**every** discovered service, while log rules (error rate, p95 latency) only apply to
+services with logging enabled. A half-monitored service must never read as fully
+covered.
+
+Marking an error group `ignored` also stops it feeding the error-rate alert — otherwise
+the ignore button would be a lie.
 
 Metrics are collected for **every** service regardless of log selection — roughly
 5 MB/day for fifty services. An unselected service still needs a graph when it

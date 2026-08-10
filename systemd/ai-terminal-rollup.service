@@ -1,0 +1,11 @@
+[Unit]
+Description=ai-terminal rollup and error grouping
+Documentation=https://github.com/skgnandy/ai-terminal-logs
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ai-terminal/env
+ExecStart=/bin/bash /opt/ai-terminal-logs/lib/rollup.sh
+TimeoutStartSec=300

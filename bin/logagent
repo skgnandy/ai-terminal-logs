@@ -104,6 +104,9 @@ print(json.dumps({
         "vector": sh("systemctl is-active vector") == "active",
         "receiver": sh("systemctl is-active ai-terminal-receiver") == "active",
         "partitionTimer": sh("systemctl is-active ai-terminal-partitions.timer") == "active",
+        "alertTimer": sh("systemctl is-active ai-terminal-alerts.timer") == "active",
+        "rollupTimer": sh("systemctl is-active ai-terminal-rollup.timer") == "active",
+        "probeTimer": sh("systemctl is-active ai-terminal-probes.timer") == "active",
         "clockSynced": sh("timedatectl show -p NTPSynchronized --value") == "yes",
     },
     "maintenance": {
@@ -115,6 +118,14 @@ print(json.dumps({
         "recent": [r for r in q(
             "SELECT ts||' '||action||' '||coalesce(detail,'') FROM maintenance_log "
             "ORDER BY ts DESC LIMIT 5;").splitlines() if r],
+    },
+    "alerts": {
+        "firing": qi("SELECT count(*) FROM alert_state WHERE state='firing';"),
+        "rules": qi("SELECT count(*) FROM alert_rules WHERE enabled;"),
+        "openErrorGroups": qi("SELECT count(*) FROM error_groups WHERE state='open';"),
+        "channels": sorted(
+            json.load(open("/etc/ai-terminal/channels.json")).keys()
+            if os.path.exists("/etc/ai-terminal/channels.json") else []),
     },
     "stats": {
         "rows": qi("SELECT count(*) FROM log_entries;"),
@@ -188,6 +199,71 @@ PY
   echo '{"ok":true}'
 }
 
+# Rule management. Rules target services by pattern, never by name, so a service
+# deployed tomorrow inherits every rule without being registered anywhere.
+cmd_alerts() {
+  case "${1:-list}" in
+    list)
+      pgq -c "SELECT coalesce(json_agg(row_to_json(r)),'[]') FROM (
+                SELECT a.id, a.name, a.kind, a.threshold, a.window_secs,
+                       a.enabled, a.silenced_until, a.channels,
+                       (SELECT count(*) FROM alert_state s
+                          WHERE s.rule_id = a.id AND s.state = 'firing') AS firing
+                FROM alert_rules a ORDER BY a.id) r;"
+      ;;
+    coverage)
+      # Log rules only cover services with logging enabled. A half-monitored
+      # service must never display as fully covered.
+      python3 "$LIB_DIR/alerts.py" --coverage
+      ;;
+    events)
+      pgq -c "SELECT coalesce(json_agg(row_to_json(e)),'[]') FROM (
+                SELECT e.ts, e.service, e.host, e.value, e.state, r.name, r.kind
+                FROM alert_events e LEFT JOIN alert_rules r ON r.id = e.rule_id
+                ORDER BY e.ts DESC LIMIT ${2:-100}) e;"
+      ;;
+    firing)
+      pgq -c "SELECT coalesce(json_agg(row_to_json(s)),'[]') FROM (
+                SELECT s.service, s.since, r.name, r.kind
+                FROM alert_state s JOIN alert_rules r ON r.id = s.rule_id
+                WHERE s.state = 'firing' ORDER BY s.since DESC) s;"
+      ;;
+    set)      python3 "$LIB_DIR/alert-rule.py" "${2:?rule id required}" "${3:?json patch required}" ;;
+    silence)  pgq -c "UPDATE alert_rules SET silenced_until = now() + interval '${3:-60} minutes'
+                      WHERE id = ${2:?rule id required};" >/dev/null && echo '{"ok":true}' ;;
+    unsilence) pgq -c "UPDATE alert_rules SET silenced_until = NULL
+                       WHERE id = ${2:?rule id required};" >/dev/null && echo '{"ok":true}' ;;
+    run)      python3 "$LIB_DIR/alerts.py" ;;
+    *) die "usage: logagent alerts {list|firing|coverage|events [n]|set <id> '<patch>'|silence <id> [min]|unsilence <id>|run}" ;;
+  esac
+}
+
+# Exception triage. Ignoring a group also stops it feeding the error-rate alert —
+# otherwise the ignore button would be a lie and people stop trusting it.
+cmd_errors() {
+  case "${1:-list}" in
+    list)
+      local filter="AND state <> 'ignored'"
+      [ "${2:-}" = "all" ] && filter=""
+      pgq -c "SELECT coalesce(json_agg(row_to_json(g)),'[]') FROM (
+                SELECT fp, service, host, severity, sample, first_seen, last_seen,
+                       occurrences, state
+                FROM error_groups WHERE true $filter
+                ORDER BY last_seen DESC LIMIT ${3:-100}) g;"
+      ;;
+    state)
+      case "${3:-}" in
+        open|ignored|resolved) ;;
+        *) die "state must be open, ignored or resolved" ;;
+      esac
+      pgq -c "UPDATE error_groups SET state = '$3'
+              WHERE fp = '${2:?fingerprint required}';" >/dev/null
+      echo '{"ok":true}'
+      ;;
+    *) die "usage: logagent errors {list [all] [limit]|state <fp> <open|ignored|resolved>}" ;;
+  esac
+}
+
 cmd_pause() {
   systemctl stop vector >/dev/null 2>&1 || true
   python3 -c "
@@ -216,7 +292,8 @@ cmd_uninstall() {
 
   systemctl disable --now vector ai-terminal-receiver \
     ai-terminal-partitions.timer ai-terminal-watchdog.timer \
-    ai-terminal-metrics.timer >/dev/null 2>&1 || true
+    ai-terminal-metrics.timer ai-terminal-rollup.timer \
+    ai-terminal-alerts.timer ai-terminal-probes.timer >/dev/null 2>&1 || true
 
   docker rm -f "$PG_CONTAINER"   >/dev/null 2>&1 || true
   docker volume rm "$PG_VOLUME"  >/dev/null 2>&1 || true
@@ -243,6 +320,10 @@ case "${1:-status}" in
   notify)    shift; python3 "$LIB_DIR/notify.py" "${1:-test}" "${2:-{\}}" ;;
   pause)     cmd_pause ;;
   resume)    cmd_resume ;;
+  alerts)    shift; cmd_alerts "$@" ;;
+  errors)    shift; cmd_errors "$@" ;;
+  probe)     bash "$LIB_DIR/probes.sh" ;;
+  rollup)    bash "$LIB_DIR/rollup.sh" ;;
   reload)    bash "$LIB_DIR/vector-config.sh" ;;
   maintain)  bash "$LIB_DIR/partitions.sh" ;;
   uninstall) shift; cmd_uninstall "${1:-}" ;;
@@ -254,6 +335,10 @@ usage: logagent <command>
   status                        JSON: config, discovered services, health, stats
   set --json '<patch>' [--purge]  merge config; retention changes apply immediately
   channels --json '<patch>'     configure fcm / telegram / smtp
+  alerts <sub>                  list | firing | coverage | events | set | silence | run
+  errors <sub>                  list [all] | state <fp> <open|ignored|resolved>
+  probe                         run database and certificate probes now
+  rollup                        recompute rollups and error groups now
   notify "<message>" ['<data>'] send a test alert through every channel
   pause | resume                stop or start collection (data retained)
   reload                        regenerate vector config
