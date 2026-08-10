@@ -30,11 +30,21 @@ die()  { printf '\033[31m[logagent] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"; }
 
-# `|| true` is load-bearing. Without it the function returns 1 whenever the env
-# file does not exist yet, and every caller runs under `set -e` — so `logagent
-# status` on a part-installed machine would exit 1 printing nothing, which reads
-# as "agent broken" rather than "agent not configured yet".
-load_env() { [ -f "$ENV_FILE" ] && . "$ENV_FILE" || true; }
+# `set -a` is load-bearing, not tidiness. The env file holds bare `PG_PORT=5499`
+# assignments, so plain sourcing makes them shell variables — invisible to the
+# python3 and psql subprocesses that actually read them. `logagent status` then
+# reported dbPort 0, and the app dutifully tunnelled to 127.0.0.1:0 and showed
+# "the underlying socket to Postgres was closed".
+#
+# `|| true` is load-bearing too: without it the function returns 1 whenever the
+# env file does not exist yet, and every caller runs under `set -e` — so status
+# on a part-installed machine exited 1 printing nothing, which reads as "agent
+# broken" rather than "agent not configured yet".
+load_env() {
+  set -a
+  [ -f "$ENV_FILE" ] && . "$ENV_FILE" || true
+  set +a
+}
 
 free_bytes() { df -B1 --output=avail / | tail -1 | tr -d ' '; }
 gb()         { echo $(( ${1:-0} / 1024 / 1024 / 1024 )); }
