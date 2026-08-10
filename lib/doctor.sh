@@ -154,6 +154,32 @@ else
   journalctl -u ai-terminal-receiver --no-pager --lines=10 2>/dev/null | sed 's/^/          /'
 fi
 
+# ── timers ───────────────────────────────────────────────────────────────────
+head_ "timers"
+# The dashboard reads pre-aggregated tables, so a dead timer shows up as a blank
+# chart rather than an error — cpu, memory and p95 simply stay "—" forever with
+# nothing anywhere to say why.
+for t in metrics rollup partitions alerts probes watchdog; do
+  unit="ai-terminal-$t.timer"
+  if ! systemctl cat "$unit" >/dev/null 2>&1; then
+    bad "$t timer      not installed"
+    continue
+  fi
+  ts=$(systemctl is-active "$unit" 2>/dev/null)
+  ts=${ts:-unknown}
+  if [ "$ts" = "active" ]; then
+    ok "$t timer      active (last run: $(systemctl show "ai-terminal-$t.service" -p ExecMainStatus --value 2>/dev/null | sed 's/^0$/success/;s/^$/never/'))"
+  else
+    bad "$t timer      $ts"
+  fi
+  # A timer can be perfectly active while the service it triggers fails every
+  # time, which is exactly how an empty metrics table looks from the outside.
+  if [ "$(systemctl show "ai-terminal-$t.service" -p ExecMainStatus --value 2>/dev/null)" != "0" ]; then
+    journalctl -u "ai-terminal-$t.service" --no-pager --lines=5 -o cat 2>/dev/null \
+      | sed "s/^/          $t: /"
+  fi
+done
+
 head_ "database"
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   ok "container      $PG_CONTAINER running on 127.0.0.1:${PG_PORT:-unset}"

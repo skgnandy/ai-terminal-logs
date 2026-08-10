@@ -139,6 +139,20 @@ EOF
 source = '''
   raw = to_string(.message) ?? ""
 
+  # ── strip terminal escapes ───────────────────────────────────────────────
+  # At ingest, not at render. Colour carries no information the database needs
+  # — severity is already its own column — and leaving the escapes in breaks
+  # everything downstream: a search for "Request completed" never matches
+  # because the stored text is "\e[36mRequest completed\e[39m", error
+  # fingerprints group on colour as well as message, and every consumer (app,
+  # alert email, Telegram) would need its own decoder.
+  #
+  # PM2 and Docker capture a process's stdout verbatim, so on a colourised Node
+  # service the escapes can outweigh the message itself.
+  raw = replace(raw, r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', "")   # OSC (window title)
+  raw = replace(raw, r'\x1b\[[0-9;?]*[ -/]*[@-~]', "")         # CSI (colour, cursor)
+  raw = replace(raw, r'\x1b[@-Z\\-_]', "")                     # remaining two-byte escapes
+
   # ── service and kind ─────────────────────────────────────────────────────
   if exists(.container_name) {
     .service = string!(.container_name)
