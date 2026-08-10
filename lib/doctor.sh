@@ -77,7 +77,11 @@ fi
 if systemctl cat vector >/dev/null 2>&1; then
   ok "service unit   $(systemctl show vector -p FragmentPath --value 2>/dev/null)"
   info "enabled        $(systemctl is-enabled vector 2>/dev/null || echo unknown)"
-  STATE_V=$(systemctl is-active vector 2>/dev/null || echo unknown)
+  # NOT `$(... || echo unknown)`. `systemctl is-active` prints the state AND
+  # exits non-zero when it is not active, so that form captures both and reports
+  # "inactive\nunknown".
+  STATE_V=$(systemctl is-active vector 2>/dev/null)
+  STATE_V=${STATE_V:-unknown}
   if [ "$STATE_V" = "active" ]; then
     ok "state          active"
     info "running since  $(systemctl show vector -p ActiveEnterTimestamp --value 2>/dev/null)"
@@ -141,7 +145,8 @@ info "journald       $(command -v journalctl >/dev/null 2>&1 && echo present || 
 
 # ── 6. receiver and database ─────────────────────────────────────────────────
 head_ "receiver"
-R_STATE=$(systemctl is-active ai-terminal-receiver 2>/dev/null || echo unknown)
+R_STATE=$(systemctl is-active ai-terminal-receiver 2>/dev/null)
+R_STATE=${R_STATE:-unknown}
 if [ "$R_STATE" = "active" ]; then
   ok "state          active on 127.0.0.1:${RECEIVER_PORT:-9080}"
 else

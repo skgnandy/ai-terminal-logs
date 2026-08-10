@@ -184,8 +184,17 @@ source = '''
            parse_timestamp(plain.t, "%Y-%m-%dT%H:%M:%S%.3f") ?? null
     }
   }
-  if ts == null && exists(.timestamp) { ts = to_timestamp(.timestamp) ?? null }
-  .ts = format_timestamp!(ts ?? now(), "%+")
+  # Vector already stamps every event, so an unparseable line falls back to
+  # ingest time rather than being dropped.
+  #
+  # Two VRL rules make this more verbose than it looks. There is no
+  # to_timestamp() — .timestamp is already a timestamp, so it is tested and
+  # assigned rather than converted. And `??` coalesces ERRORS, not nulls: using
+  # it on a plain variable is rejected outright with "this expression can't
+  # fail", so a null has to be handled by an explicit branch.
+  if ts == null && is_timestamp(.timestamp) { ts = .timestamp }
+  if ts == null { ts = now() }
+  .ts = format_timestamp!(ts, "%+")
 
   # ── severity ─────────────────────────────────────────────────────────────
   # NOT mapping pm2 stderr to ERROR. In practice PM2 error logs are full of
@@ -214,7 +223,10 @@ source = '''
       .attrs = { "status": code, "duration_ms": to_int(http.ms) ?? 0 }
     }
   }
-  .severity = sev ?? "INFO"
+  # Explicit branch, not `sev ?? "INFO"` — see the note above: `??` handles
+  # errors, and a plain variable cannot error, so VRL rejects that form.
+  if sev == null { sev = "INFO" }
+  .severity = sev
 
   # ── redaction ────────────────────────────────────────────────────────────
   # Applied BEFORE the write. This store is queried from a phone and kept for
@@ -241,8 +253,13 @@ PARSE
 [transforms.selected]
 type = "filter"
 inputs = ["parse"]
+# No error-coalescing operator here: includes() cannot fail, and VRL rejects
+# coalescing on an expression that cannot error. An empty allowlist already
+# yields false, which is the behaviour that matters — the agent must store
+# nothing until services are chosen.
+# (This heredoc is unquoted: no backticks, they would be run as commands.)
 condition = '''
-  includes($services_json, .service) ?? false
+  includes($services_json, .service)
 '''
 
 [sinks.receiver]
