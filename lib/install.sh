@@ -150,19 +150,43 @@ systemctl enable --now ai-terminal-probes.timer     >/dev/null 2>&1 || true
 
 # ── 7. first partitions + vector config ──────────────────────────────────────
 bash "$PREFIX/lib/partitions.sh" >/dev/null 2>&1 || warn "initial partition creation failed"
-bash "$PREFIX/lib/vector-config.sh" >/dev/null 2>&1 || warn "initial vector config generation failed"
+
+# stdout discarded, stderr kept: this is where "vector is NOT running" is
+# reported, and an install that silently collects nothing is the failure this
+# agent exists to prevent.
+#
+# vector-config.sh decides the collector's final state from `paused` in the
+# config — stopped when paused, restarted when not. It is deliberately the LAST
+# word on that. This script used to follow it with an unconditional
+# `systemctl stop vector`, which was right for a fresh install and wrong for
+# every update: the installer preserves an existing config, so re-running it on
+# a configured machine regenerated the config, started the collector, and then
+# immediately killed it. The machine then read as configured and unpaused with
+# nothing being collected.
+bash "$PREFIX/lib/vector-config.sh" >/dev/null \
+  || warn "collection is not running — see above"
+
 # Seed the rollup so the dashboard is not blank the first time it is opened.
 bash "$PREFIX/lib/rollup.sh" >/dev/null 2>&1 || true
 
-# Paused until configured — vector must not start yet.
-systemctl stop vector >/dev/null 2>&1 || true
-
 # ── 8. report ────────────────────────────────────────────────────────────────
+#
+# Report the state that IS, not the state a fresh install would have had. This
+# block used to print "PAUSED, collecting nothing" unconditionally, so an update
+# of a live machine ended with a line contradicting what it had just done.
+if systemctl is-active --quiet vector; then
+  COLLECT_STATE="COLLECTING — $(json_get "$CONF" days 0) day retention"
+elif [ "$(json_get "$CONF" paused true)" = "true" ]; then
+  COLLECT_STATE="PAUSED, collecting nothing"
+else
+  COLLECT_STATE="NOT COLLECTING — collector is down, see the warning above"
+fi
+
 cat <<EOF
 
 $(log "install complete")
 
-  agent       $VERSION  —  PAUSED, collecting nothing
+  agent       $VERSION  —  $COLLECT_STATE
   host        $HOST_NAME   (timezone $TZ_NAME)
   database    127.0.0.1:$PG_PORT/$PG_DB   user=$PG_USER
   password    $ETC/pgpass
