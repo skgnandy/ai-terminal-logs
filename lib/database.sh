@@ -63,4 +63,9 @@ apply_schema() {
   log "schema version $v"
 }
 
-[ "${BASH_SOURCE[0]}" = "$0" ] && { install_db; apply_schema; }
+# `if`, not `&&` — see the note in preflight.sh. As the last statement in a
+# sourced file the `&&` form returns 1 and silently aborts the caller.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  install_db
+  apply_schema
+fi

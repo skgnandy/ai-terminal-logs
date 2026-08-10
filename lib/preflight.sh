@@ -61,4 +61,10 @@ cap_pm2() {
   pm2 set pm2-logrotate:compress true >/dev/null 2>&1 || true
 }
 
-[ "${BASH_SOURCE[0]}" = "$0" ] && preflight
+# `if`, not `[ … ] && preflight`. As the last statement in a SOURCED file the
+# `&&` form returns 1 when the test fails, which under the caller's `set -e`
+# aborts the installer at the `.` line — before this file's functions are ever
+# called, and with nothing printed to say why.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  preflight
+fi

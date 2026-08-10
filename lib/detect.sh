@@ -54,4 +54,8 @@ detect() {
   export HOST_NAME TZ_NAME HAS_DOCKER HAS_JOURNAL NGINX_LOG_DIR PG_PORT RECEIVER_PORT
 }
 
-[ "${BASH_SOURCE[0]}" = "$0" ] && detect
+# `if`, not `&&` — see the note in preflight.sh. As the last statement in a
+# sourced file the `&&` form returns 1 and silently aborts the caller.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  detect
+fi
