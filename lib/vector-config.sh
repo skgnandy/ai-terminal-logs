@@ -12,6 +12,28 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
+# Validate one config file, writing the reason to the state directory on failure.
+#
+# Vector moved `validate` from taking `--config <file>` to taking the path as a
+# positional argument, and the two forms are not interchangeable — the old one
+# now dies with "unexpected argument '--config' found" before it reads a single
+# line of config. Try the current form and fall back only when the CLI rejected
+# the ARGUMENT, never when it rejected the config: retrying a genuine config
+# error under the other form would report it as a version problem.
+validate_config() {
+  local f="$1" out
+  out=$(vector validate --no-environment "$f" 2>&1) && return 0
+
+  case "$out" in
+    *"unexpected argument"*|*"Found argument"*|*"USAGE:"*|*"Usage:"*)
+      out=$(vector validate --no-environment --config "$f" 2>&1) && return 0
+      ;;
+  esac
+
+  printf '%s\n' "$out" > "$STATE/vector-config.error"
+  return 1
+}
+
 generate() {
   local tmp="$VECTOR_CONF.tmp"
   install -d -m 755 /etc/vector "$STATE/vector"
@@ -257,7 +279,7 @@ EOF
   # collector stopped with no fault of its own — systemd reports a perfectly
   # healthy "inactive (dead)" unit — so without this the only trace of the real
   # reason is a line of installer output that has already scrolled away.
-  if ! vector validate --no-environment --config "$tmp" >"$STATE/vector-config.error" 2>&1; then
+  if ! validate_config "$tmp"; then
     warn "generated vector config failed validation:"
     sed 's/^/    /' "$STATE/vector-config.error" >&2
     rm -f "$tmp"

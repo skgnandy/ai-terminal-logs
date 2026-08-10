@@ -63,10 +63,14 @@ chmod 600 "$ENV_FILE"
 
 # Paused, no retention, no services. Disk stays untouched until configured.
 if [ ! -f "$CONF" ]; then
+  # days is 1, not null: a default that costs the least disk any real retention
+  # can, and lets the app open on a sensible value instead of an empty one. It
+  # is not what starts collection — logServices is empty, so the agent stays
+  # paused and stores nothing until services are chosen.
   cat > "$CONF" <<'EOF'
 {
   "paused": true,
-  "days": null,
+  "days": 1,
   "sources": {
     "pm2": true,
     "docker": true,
