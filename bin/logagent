@@ -92,7 +92,19 @@ db_running = container in sh("docker ps --format '{{.Names}}'").splitlines()
 vector_state = sh("systemctl is-active vector") or "unknown"
 collector_detail = ""
 if vector_state != "active":
-    if not sh("systemctl cat vector 2>/dev/null"):
+    # Order matters: check the config BEFORE the unit. A config that failed
+    # validation leaves the collector deliberately unstarted, so systemd reports
+    # a blameless "inactive (dead)" and its journal says nothing at all — the
+    # real reason is only in the validation log.
+    cfg_error = "/var/lib/ai-terminal/vector-config.error"
+    if os.path.exists(cfg_error):
+        collector_detail = ("the generated Vector config was rejected, so the "
+                            "collector was never started:\n\n"
+                            + open(cfg_error).read())
+    elif not os.path.exists("/etc/vector/vector.toml"):
+        collector_detail = ("no Vector config on this machine — "
+                            "run: logagent reload")
+    elif not sh("systemctl cat vector 2>/dev/null"):
         collector_detail = ("no vector service unit on this machine — "
                             "re-run the installer to add one")
     else:

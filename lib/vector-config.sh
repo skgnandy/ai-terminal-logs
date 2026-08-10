@@ -44,7 +44,11 @@ type = "file"
 include = [ $PM2_LOG_DIRS_CSV ]
 read_from = "end"
 ignore_older_secs = 86400      # never replay a year-old backlog on first start
-include_file_metadata = true
+# No include_file_metadata here. It is not an option of the file source, so
+# validation rejected the whole config and the collector was never started.
+# The path the parser needs arrives as .file anyway; file_key defaults to it.
+# Note: no backticks in this heredoc — it is unquoted, so backticks would be
+# run as command substitution while the config is being generated.
 
 # A record begins at column 0; indented lines continue it. This is what makes a
 # 30-line stack trace one row instead of thirty — error grouping depends on it.
@@ -86,7 +90,6 @@ type = "file"
 include = [ "$NGINX_LOG_DIR/*.log" ]
 read_from = "end"
 ignore_older_secs = 86400
-include_file_metadata = true
 EOF
     fi
 
@@ -123,8 +126,11 @@ source = '''
     .kind = "systemd"
   } else if exists(.file) {
     path = string!(.file)
-    name = split(path, "/") ?? []
-    base = if length(name) > 0 { name[-1] } else { path }
+    # Basename by regex, not split()+index. VRL has no negative array indexing,
+    # so `parts[-1]` fails to compile and `vector validate` rejects the entire
+    # config — which leaves the collector stopped rather than degraded.
+    tail = parse_regex(path, r'(?P<b>[^/]+)$') ?? null
+    base = if tail != null { string!(tail.b) } else { path }
     if starts_with(path, "/var/log/nginx") {
       .service = replace(string!(base), ".log", "")
       .kind = "nginx"
@@ -246,12 +252,18 @@ EOF
 
   # Fail loudly. Installing a config that silently collects nothing is the worst
   # outcome, so validation is mandatory and the old config is kept on failure.
-  if ! vector validate --no-environment --config "$tmp" >/tmp/vector-validate.log 2>&1; then
+  #
+  # The error is also persisted, not just printed. A rejected config leaves the
+  # collector stopped with no fault of its own — systemd reports a perfectly
+  # healthy "inactive (dead)" unit — so without this the only trace of the real
+  # reason is a line of installer output that has already scrolled away.
+  if ! vector validate --no-environment --config "$tmp" >"$STATE/vector-config.error" 2>&1; then
     warn "generated vector config failed validation:"
-    sed 's/^/    /' /tmp/vector-validate.log >&2
+    sed 's/^/    /' "$STATE/vector-config.error" >&2
     rm -f "$tmp"
     return 1
   fi
+  rm -f "$STATE/vector-config.error"
 
   mv "$tmp" "$VECTOR_CONF"
   log "vector config written and validated"
