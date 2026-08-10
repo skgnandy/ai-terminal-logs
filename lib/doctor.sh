@@ -202,8 +202,41 @@ else
 fi
 
 # ── 7. recent collector output ───────────────────────────────────────────────
-head_ "last 20 collector log lines"
-journalctl -u vector --no-pager --lines=20 -o cat 2>/dev/null | sed 's/^/  /' \
+#
+# Scoped to the CURRENT run, not the last N lines.
+#
+# A plain tail mixes a start that failed with the one that then succeeded, so a
+# config error already fixed minutes ago reads exactly like a live one — and the
+# reverse: a real error scrolls out of view behind healthy startup chatter. The
+# only question worth answering is whether the collector that is running right
+# now has complained.
+head_ "collector errors since it started"
+SINCE=$(systemctl show vector -p ActiveEnterTimestamp --value 2>/dev/null)
+if [ -z "$SINCE" ]; then
+  info "collector has never started"
+else
+  # systemd prints "Mon 2026-08-10 23:22:02 IST", which journalctl does not
+  # reliably parse. Convert to epoch, which it always accepts as @<seconds>.
+  SINCE_ARG=$(date -d "$SINCE" +@%s 2>/dev/null) || SINCE_ARG="$SINCE"
+  [ -n "$SINCE_ARG" ] || SINCE_ARG="$SINCE"
+
+  V_ERRS=$(journalctl -u vector --no-pager -o cat --since "$SINCE_ARG" 2>/dev/null \
+    | grep -E 'ERROR|error\[E[0-9]+\]|panicked' | head -25)
+  if [ -n "$V_ERRS" ]; then
+    bad "the running collector is logging errors:"
+    printf '%s\n' "$V_ERRS" | sed 's/^/          /'
+  else
+    ok "none since $SINCE"
+  fi
+fi
+
+# Restart count separates "started cleanly" from "crash-looping into a start
+# that happened to work". NRestarts survives the restarts themselves.
+info "restarts       $(systemctl show vector -p NRestarts --value 2>/dev/null || echo '?')"
+
+head_ "last 25 collector log lines"
+info "(may include a previous, already-corrected start — see the section above)"
+journalctl -u vector --no-pager --lines=25 -o cat 2>/dev/null | sed 's/^/  /' \
   || info "no journal for vector"
 
 # ── 8. verdict ───────────────────────────────────────────────────────────────
