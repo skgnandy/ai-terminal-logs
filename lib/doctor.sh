@@ -211,7 +211,22 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
     bad "metrics        no samples in the last 10 minutes — cpu and memory will be blank"
   fi
   [ "${M_PM2:-0}" -eq 0 ] && [ -d /root/.pm2 ] && \
-    bad "pm2 metrics    none, though /root/.pm2 exists — run: PM2_HOME=/root/.pm2 pm2 jlist"
+    bad "pm2 metrics    none, though /root/.pm2 exists"
+
+  # What the collector itself said. Every failure mode in it used to be silenced
+  # individually by 2>/dev/null and || true, so an empty metrics table was
+  # indistinguishable from a machine with nothing to report.
+  if [ -s "$STATE/metrics.error" ]; then
+    bad "metrics collector reported:"
+    sed 's/^/          /' "$STATE/metrics.error"
+  fi
+
+  # Last resort: run the collectors now and show what SQL they would produce.
+  # Reading the code has been guesswork three times; this answers it.
+  if [ "${M_RECENT:-0}" -eq 0 ]; then
+    info "dry run of the metric collectors:"
+    bash "$LIB_DIR/metrics.sh" --dry-run 2>&1 | head -25 | sed 's/^/          /'
+  fi
 
   info "host samples   $(pgq -c "SELECT count(*) FROM host_metrics WHERE ts > now() - interval '10 minutes';" 2>/dev/null || echo 0) in 10 min"
 else

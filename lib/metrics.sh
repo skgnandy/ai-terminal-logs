@@ -10,6 +10,24 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
+# systemd gives a service a minimal PATH — /usr/local/sbin:/usr/local/bin:
+# /usr/sbin:/usr/bin:/sbin:/bin — and nothing else. A pm2 installed through nvm
+# or a versioned node lives outside all of it, so `command -v pm2` found nothing
+# and the collector skipped PM2 entirely without a word. Look where node
+# managers actually put things before giving up.
+find_pm2() {
+  local p
+  p=$(command -v pm2 2>/dev/null) && { echo "$p"; return 0; }
+  for p in /usr/local/bin/pm2 /usr/bin/pm2 \
+           /root/.nvm/versions/node/*/bin/pm2 \
+           /root/.volta/bin/pm2 \
+           /usr/local/n/versions/node/*/bin/pm2 \
+           /home/*/.nvm/versions/node/*/bin/pm2; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 collect_host() {
   local total used dtotal dused load1
   read -r total used <<<"$(free -b | awk '/^Mem:/{print $2, $3}')"
@@ -23,7 +41,8 @@ VALUES(now(),'%s',%s,%s,%s,%s,%s);\n" \
 }
 
 collect_pm2() {
-  command -v pm2 >/dev/null 2>&1 || return 0
+  local pm2_bin
+  pm2_bin=$(find_pm2) || { note "pm2 binary not found on PATH or in any node manager directory"; return 0; }
 
   # PM2_HOME must be explicit. systemd does not set HOME for a system service
   # unless User= is given, and PM2 resolves its process store from PM2_HOME or
@@ -34,10 +53,11 @@ collect_pm2() {
   #
   # Iterating the homes also fixes a case the single call never handled: PM2
   # running under a non-root user, which is the norm on shared boxes.
-  local home
+  local home found=0
   for home in /root/.pm2 /home/*/.pm2; do
     [ -d "$home" ] || continue
-    PM2_HOME="$home" pm2 jlist 2>/dev/null | python3 - "$HOST_NAME" <<'PY' || true
+    found=1
+    PM2_HOME="$home" "$pm2_bin" jlist 2>>"$ERR_LOG" | python3 - "$HOST_NAME" <<'PY' || true
 import json, sys
 host = sys.argv[1]
 try:
@@ -62,18 +82,19 @@ for p in procs:
     )
 PY
   done
+  [ "$found" -eq 1 ] || note "pm2 found at $pm2_bin but no .pm2 directory under /root or /home/*"
 }
 
 collect_docker() {
-  command -v docker >/dev/null 2>&1 || return 0
+  command -v docker >/dev/null 2>&1 || { note "docker not on PATH"; return 0; }
 
   # `docker stats` gives live CPU/memory; `docker ps` gives health, which stats
   # omits. Health is what surfaces a container that has been failing checks for
   # months while still reporting "Up".
   local health_map
-  health_map=$(docker ps --format '{{.Names}}|{{.Status}}' 2>/dev/null || true)
+  health_map=$(docker ps --format '{{.Names}}|{{.Status}}' 2>>"$ERR_LOG" || true)
 
-  docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' 2>/dev/null \
+  docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' 2>>"$ERR_LOG" \
   | python3 - "$HOST_NAME" "$PG_CONTAINER" "$health_map" <<'PY' || true
 import re, sys
 host, skip, health_raw = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -109,8 +130,47 @@ PY
 }
 
 main() {
-  docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER" || exit 0
-  { collect_host; collect_pm2; collect_docker; } | pgq >/dev/null 2>&1 || true
+  docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER" \
+    || { note "logs database container is not running"; exit 0; }
+
+  # `|| true` because one collector failing must not cost the others their
+  # samples — the previous shape lost every metric whenever any single source
+  # was unavailable.
+  local sql
+  sql=$({ collect_host; collect_pm2; collect_docker; }) || true
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "$sql"
+    echo "--- collector notes ---" >&2
+    cat "$ERR_LOG" >&2 2>/dev/null || true
+    return 0
+  fi
+
+  # psql errors were going to /dev/null, so a statement that failed for every
+  # row — a missing partition, a column type change — looked exactly like a
+  # collector that had nothing to say. Keep the output and record it.
+  local out
+  out=$(printf '%s\n' "$sql" | pgq 2>&1) || true
+  [ -n "$out" ] && printf '%s\n' "$out" >> "$ERR_LOG"
+
+  # One file, overwritten each run, so the diagnostic reports what is wrong NOW
+  # rather than every failure since install.
+  if [ -s "$ERR_LOG" ]; then
+    mv "$ERR_LOG" "$STATE/metrics.error"
+  else
+    rm -f "$ERR_LOG" "$STATE/metrics.error"
+  fi
 }
+
+# Notes and captured stderr go to one scratch file that main() promotes to
+# $STATE/metrics.error. Without this the collector's every failure mode — no
+# pm2, no docker, rejected SQL — was indistinguishable from "nothing to report",
+# because each one was individually silenced by 2>/dev/null and || true.
+ERR_LOG=$(mktemp)
+trap 'rm -f "$ERR_LOG"' EXIT
+note() { printf '%s\n' "$*" >> "$ERR_LOG"; }
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
 main "$@"
