@@ -31,16 +31,16 @@ trade-off — it is an outage.
 
 This agent does the useful 70% in **~250 MB**:
 
-| | This agent | A full platform |
-|---|---|---|
-| RAM | ~250 MB | 4 GB minimum |
-| Containers | 1 | 4–5 |
-| Storage | Postgres (dedicated container) | column store + metadata DB + coordinator |
-| Logs, retention, search | yes | yes |
-| Metrics history | yes | yes |
-| Alerting | yes | yes |
-| Distributed traces | **no** | yes |
-| Cost | none | a server |
+| | This agent |
+|---|---|
+| RAM | ~250 MB |
+| Containers | 1 |
+| Storage | Postgres (dedicated container) |
+| Logs, retention, search | yes |
+| Metrics history | yes |
+| Alerting | yes |
+| Distributed traces | **no** |
+| Cost | none |
 
 If you need distributed traces and p95 latency across dozens of hosts, run a full
 platform. If you need to know what broke, when, and be told about it — this is enough.
