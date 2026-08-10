@@ -197,6 +197,23 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   info "oldest         $(pgq -c 'SELECT min(ts) FROM log_entries;' 2>/dev/null || echo '-')"
   info "newest         $(pgq -c 'SELECT max(ts) FROM log_entries;' 2>/dev/null || echo '-')"
   info "size           $(pgq -c 'SELECT pg_size_pretty(pg_database_size(current_database()));' 2>/dev/null || echo '?')"
+
+  # Metrics separately from logs. They arrive by a completely different path —
+  # a timer shelling out to pm2 and docker, not the collector — so "logs are
+  # flowing" says nothing about whether the cpu and memory graphs will have
+  # anything in them, and a green metrics timer only means the script exited 0.
+  M_RECENT=$(pgq -c "SELECT count(*) FROM metrics WHERE ts > now() - interval '10 minutes';" 2>/dev/null || echo 0)
+  M_PM2=$(pgq -c "SELECT count(DISTINCT service) FROM metrics WHERE kind='pm2' AND ts > now() - interval '10 minutes';" 2>/dev/null || echo 0)
+  M_DOCKER=$(pgq -c "SELECT count(DISTINCT service) FROM metrics WHERE kind='docker' AND ts > now() - interval '10 minutes';" 2>/dev/null || echo 0)
+  if [ "${M_RECENT:-0}" -gt 0 ]; then
+    ok "metrics        ${M_RECENT} samples in 10 min (pm2: ${M_PM2} services, docker: ${M_DOCKER})"
+  else
+    bad "metrics        no samples in the last 10 minutes — cpu and memory will be blank"
+  fi
+  [ "${M_PM2:-0}" -eq 0 ] && [ -d /root/.pm2 ] && \
+    bad "pm2 metrics    none, though /root/.pm2 exists — run: PM2_HOME=/root/.pm2 pm2 jlist"
+
+  info "host samples   $(pgq -c "SELECT count(*) FROM host_metrics WHERE ts > now() - interval '10 minutes';" 2>/dev/null || echo 0) in 10 min"
 else
   bad "container $PG_CONTAINER is not running"
 fi

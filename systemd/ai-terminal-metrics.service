@@ -7,4 +7,10 @@ Requires=docker.service
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/ai-terminal/env
+# systemd does not set HOME for a system service unless User= is given, and
+# tools this script shells out to resolve their state directory from it.
+# metrics.sh sets PM2_HOME explicitly for the case that actually broke; this
+# stops a service running with no HOME at all from being a trap for whatever
+# gets added next.
+Environment=HOME=/root
 ExecStart=/bin/bash /opt/ai-terminal-logs/lib/metrics.sh

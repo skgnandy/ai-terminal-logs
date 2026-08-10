@@ -24,7 +24,20 @@ VALUES(now(),'%s',%s,%s,%s,%s,%s);\n" \
 
 collect_pm2() {
   command -v pm2 >/dev/null 2>&1 || return 0
-  pm2 jlist 2>/dev/null | python3 - "$HOST_NAME" <<'PY' || true
+
+  # PM2_HOME must be explicit. systemd does not set HOME for a system service
+  # unless User= is given, and PM2 resolves its process store from PM2_HOME or
+  # $HOME/.pm2 — with neither, `pm2 jlist` quietly returns nothing. Because the
+  # call is `|| true`-ed, that surfaced only as cpu and memory permanently blank
+  # for every PM2 service, while discovery over SSH (where HOME is set) listed
+  # them all and looked perfectly healthy.
+  #
+  # Iterating the homes also fixes a case the single call never handled: PM2
+  # running under a non-root user, which is the norm on shared boxes.
+  local home
+  for home in /root/.pm2 /home/*/.pm2; do
+    [ -d "$home" ] || continue
+    PM2_HOME="$home" pm2 jlist 2>/dev/null | python3 - "$HOST_NAME" <<'PY' || true
 import json, sys
 host = sys.argv[1]
 try:
@@ -48,6 +61,7 @@ for p in procs:
         )
     )
 PY
+  done
 }
 
 collect_docker() {
