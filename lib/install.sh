@@ -95,13 +95,35 @@ apply_schema
 install_vector() {
   if command -v vector >/dev/null 2>&1; then
     log "vector present ($(vector --version 2>/dev/null | head -1))"
-    return 0
+  else
+    log "installing vector"
+    curl -fsSL https://sh.vector.dev | bash -s -- -y --prefix /usr/local >/dev/null 2>&1 \
+      || die "vector install failed — see https://vector.dev/docs/setup/installation/"
+    export PATH="$PATH:/usr/local/bin"
+    command -v vector >/dev/null 2>&1 || die "vector installed but not on PATH"
   fi
-  log "installing vector"
-  curl -fsSL https://sh.vector.dev | bash -s -- -y --prefix /usr/local >/dev/null 2>&1 \
-    || die "vector install failed — see https://vector.dev/docs/setup/installation/"
-  export PATH="$PATH:/usr/local/bin"
-  command -v vector >/dev/null 2>&1 || die "vector installed but not on PATH"
+
+  # The quickstart installer at sh.vector.dev drops the binary and nothing else,
+  # so on a machine that got Vector that way there is no `vector` unit at all.
+  # Every `systemctl start vector` then fails, and because those calls are
+  # `|| warn`-ed the agent looks configured while collecting nothing — the exact
+  # failure this project exists to make impossible.
+  #
+  # Only when the machine has no unit of its own: a distro-packaged Vector
+  # already ships one, and replacing it would be a change to something the agent
+  # does not own.
+  if systemctl cat vector >/dev/null 2>&1; then
+    log "vector service unit already present"
+  else
+    log "installing vector service unit"
+    sed "s#VECTOR_BIN#$(command -v vector)#" "$PREFIX/systemd/vector.service" \
+      > /etc/systemd/system/vector.service
+    chmod 644 /etc/systemd/system/vector.service
+    systemctl daemon-reload
+  fi
+  # Enabled so collection survives a reboot; started later, and only if the
+  # agent is not paused.
+  systemctl enable vector >/dev/null 2>&1 || warn "could not enable vector"
 }
 install_vector
 
@@ -109,9 +131,12 @@ install_vector
 install -m 755 "$PREFIX/bin/logagent" /usr/local/bin/logagent
 
 # ── 6. systemd units ─────────────────────────────────────────────────────────
+# `ai-terminal-*` only: vector.service is templated on the binary path and is
+# installed by install_vector above, which also skips it when the machine has a
+# distro-packaged unit.
 log "installing systemd units"
-install -m 644 "$PREFIX/systemd/"*.service /etc/systemd/system/
-install -m 644 "$PREFIX/systemd/"*.timer   /etc/systemd/system/
+install -m 644 "$PREFIX/systemd/"ai-terminal-*.service /etc/systemd/system/
+install -m 644 "$PREFIX/systemd/"ai-terminal-*.timer   /etc/systemd/system/
 systemctl daemon-reload
 
 systemctl enable --now ai-terminal-receiver.service >/dev/null 2>&1 \

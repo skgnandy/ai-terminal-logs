@@ -174,7 +174,13 @@ PY
     bash "$LIB_DIR/partitions.sh" >/dev/null 2>&1 || true
   fi
 
-  bash "$LIB_DIR/vector-config.sh" >/dev/null 2>&1 || warn "vector config regeneration failed"
+  # stdout only is discarded — this command's stdout must stay parseable JSON.
+  # stderr is deliberately let through, because that is where "vector is NOT
+  # running" is reported, and a set that silently collects nothing is the whole
+  # failure this agent exists to prevent. The app reads the same fact from
+  # `health.vector` in the status below.
+  bash "$LIB_DIR/vector-config.sh" >/dev/null \
+    || warn "collection did not start — see above, then: logagent reload"
   cmd_status
 }
 

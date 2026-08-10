@@ -1,0 +1,28 @@
+[Unit]
+# Installed only when the machine has no vector unit of its own — the quickstart
+# installer at sh.vector.dev drops the binary and nothing else, so without this
+# `systemctl start vector` fails and the agent collects nothing while every
+# health check quietly reports the collector as simply "not active".
+Description=Vector (ai-terminal-logs collector)
+Documentation=https://vector.dev/docs/
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root deliberately: it reads /root/.pm2/logs, the Docker socket and the
+# journal. A dedicated user would need all three groups and would still miss
+# PM2 logs written with 0600 by a root-owned process.
+User=root
+ExecStart=VECTOR_BIN --config /etc/vector/vector.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+# Vector buffers to disk under /var/lib/ai-terminal/vector; a restart must not
+# drop what has been accepted but not yet written.
+KillMode=mixed
+TimeoutStopSec=30
+Environment=VECTOR_LOG=info
+
+[Install]
+WantedBy=multi-user.target

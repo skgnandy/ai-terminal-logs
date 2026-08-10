@@ -263,8 +263,22 @@ reload_vector() {
   if [ "$paused" = "true" ]; then
     systemctl stop vector >/dev/null 2>&1 || true
     log "agent is paused — vector stopped"
+    return 0
+  fi
+
+  systemctl restart vector >/dev/null 2>&1 || true
+
+  # Verify, do not assume. `systemctl restart` on a missing or broken unit fails
+  # in a way that used to be swallowed, leaving an agent that reports itself
+  # configured and unpaused while collecting nothing — the one failure mode this
+  # project exists to prevent. Say so, and say where to look.
+  if systemctl is-active --quiet vector; then
+    log "vector running"
   else
-    systemctl restart vector >/dev/null 2>&1 || warn "vector restart failed"
+    warn "vector is NOT running — no logs will be collected"
+    systemctl status vector --no-pager --lines=10 >&2 2>&1 || true
+    journalctl -u vector --no-pager --lines=20 >&2 2>&1 || true
+    return 1
   fi
 }
 
