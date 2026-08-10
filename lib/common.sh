@@ -30,7 +30,11 @@ die()  { printf '\033[31m[logagent] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"; }
 
-load_env() { [ -f "$ENV_FILE" ] && . "$ENV_FILE"; }
+# `|| true` is load-bearing. Without it the function returns 1 whenever the env
+# file does not exist yet, and every caller runs under `set -e` — so `logagent
+# status` on a part-installed machine would exit 1 printing nothing, which reads
+# as "agent broken" rather than "agent not configured yet".
+load_env() { [ -f "$ENV_FILE" ] && . "$ENV_FILE" || true; }
 
 free_bytes() { df -B1 --output=avail / | tail -1 | tr -d ' '; }
 gb()         { echo $(( ${1:-0} / 1024 / 1024 / 1024 )); }
