@@ -47,13 +47,33 @@ else
   trap 'rm -rf "$TMP"' EXIT
 
   say "fetching $REPO@$REF"
-  curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" -o "$TMP/agent.tar.gz" \
-    || curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/tags/$REF" -o "$TMP/agent.tar.gz" \
+
+  # Cache-busted, and not as a nicety. codeload is served through a CDN that
+  # holds a branch tarball for minutes, so an update run soon after a release
+  # downloaded the PREVIOUS commit, installed it, reported success — and left
+  # the machine on the old version. It looked exactly like a flaky updater:
+  # retry two or three times and eventually it "works", because by then the
+  # cache had expired.
+  NOCACHE="$(date +%s)-$$"
+  fetch() {
+    curl -fsSL \
+      -H 'Cache-Control: no-cache, no-store, max-age=0' \
+      -H 'Pragma: no-cache' \
+      "$1?nocache=$NOCACHE" -o "$TMP/agent.tar.gz"
+  }
+
+  fetch "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" \
+    || fetch "https://codeload.github.com/$REPO/tar.gz/refs/tags/$REF" \
     || die "could not download $REPO@$REF"
 
   tar -xzf "$TMP/agent.tar.gz" -C "$TMP"
   SRC="$(find "$TMP" -maxdepth 1 -type d -name 'ai-terminal-logs-*' | head -1)"
   [ -n "$SRC" ] || die "unexpected archive layout"
+
+  # Say which commit this actually is. The version number alone cannot
+  # distinguish "already up to date" from "the download was stale", and that
+  # ambiguity is what made the staleness above take so long to find.
+  say "fetched $(basename "$SRC" | sed 's/^ai-terminal-logs-//') (nocache=$NOCACHE)"
 fi
 
 # Replace the payload atomically so a failed download never leaves a half-written
