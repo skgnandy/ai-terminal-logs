@@ -359,6 +359,7 @@ case "${1:-status}" in
   alerts)    shift; cmd_alerts "$@" ;;
   errors)    shift; cmd_errors "$@" ;;
   doctor)    bash "$LIB_DIR/doctor.sh" ;;
+  tail)      shift; exec bash "$LIB_DIR/tail.sh" "$@" ;;
   probe)     bash "$LIB_DIR/probes.sh" ;;
   rollup)    bash "$LIB_DIR/rollup.sh" ;;
   reload)    bash "$LIB_DIR/vector-config.sh" ;;
@@ -369,6 +370,8 @@ case "${1:-status}" in
     cat >&2 <<'USAGE'
 usage: logagent <command>
 
+  tail [service...]             live tail of EVERY service, unstored, unfiltered
+                                by the log selection — Ctrl-C to stop
   doctor                        why the agent is or is not collecting, in full
   status                        JSON: config, discovered services, health, stats
   set --json '<patch>' [--purge]  merge config; retention changes apply immediately
