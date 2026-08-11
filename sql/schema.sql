@@ -243,3 +243,37 @@ CREATE INDEX IF NOT EXISTS log_entries_reqid
   WHERE attrs ? 'req_id';
 
 INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- schema v4 — key operations
+--
+-- Per-endpoint aggregates, so the app can answer "which route is slow, which
+-- route is failing" without scanning raw logs. Same reasoning as log_rollup:
+-- one small query fills the whole table instead of one scan per endpoint.
+--
+-- Keyed on the NORMALISED route (/leads/:id, not /leads/8f2c…), which the
+-- parser writes. Without that collapse a table of "top endpoints" is a list of
+-- individual requests and every row has one call.
+--
+-- method is NOT NULL with a '' fallback rather than nullable: it is part of the
+-- primary key, and a NULL there makes ON CONFLICT never match, so every rollup
+-- run would insert a duplicate row instead of updating the previous one.
+CREATE TABLE IF NOT EXISTS endpoint_rollup (
+  bucket   timestamptz NOT NULL,
+  host     text NOT NULL,
+  service  text NOT NULL,
+  method   text NOT NULL DEFAULT '',
+  route    text NOT NULL,
+  calls    int  DEFAULT 0,
+  errors   int  DEFAULT 0,   -- 5xx, or a line the parser judged ERROR/FATAL
+  clienterr int DEFAULT 0,   -- 4xx: not an outage, but a broken caller
+  p50_ms   real,
+  p95_ms   real,
+  p99_ms   real,
+  max_ms   real,
+  PRIMARY KEY (bucket, host, service, method, route)
+);
+CREATE INDEX IF NOT EXISTS endpoint_rollup_bucket ON endpoint_rollup (bucket DESC);
+CREATE INDEX IF NOT EXISTS endpoint_rollup_svc    ON endpoint_rollup (service, bucket DESC);
+
+INSERT INTO schema_version (version) VALUES (4) ON CONFLICT DO NOTHING;

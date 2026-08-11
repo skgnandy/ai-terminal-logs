@@ -270,6 +270,12 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
         count(*) FILTER (WHERE attrs->>'phase' = 'end')   || ' end'
       FROM log_entries WHERE ts > now() - interval '1 hour';" 2>/dev/null || echo '?') (last hour)"
 
+  # Read on its own as well as inside that line: the endpoints check below needs
+  # to tell "the parser found no routes" from "routes exist but nothing has
+  # aggregated them yet", and those call for opposite advice.
+  R_ROUTE=$(pgq -c "SELECT count(*) FROM log_entries
+                    WHERE ts > now() - interval '1 hour' AND attrs ? 'route';" 2>/dev/null || echo 0)
+
   if [ "${FRESH:-0}" -eq 0 ] && [ -n "$SINCE_UTC" ]; then
     info "no rows at all since the collector restarted ($SINCE)."
     info "Nothing has been through the current parser yet — wait a minute for"
@@ -346,6 +352,40 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
               AND (body ILIKE '%request completed%' OR body ILIKE '%statusCode%'
                    OR body ILIKE '%HTTP/1.%')
             ORDER BY ts DESC LIMIT 2;" 2>/dev/null || true
+  fi
+
+  # ── endpoints ──────────────────────────────────────────────────────────────
+  #
+  # The app's key-operations table reads endpoint_rollup. Reported separately
+  # from latency because the two fail independently: a machine can time every
+  # request and still show no endpoints, when the parser reads a duration out of
+  # a line that never carried a URL.
+  E_TABLE=$(pgq -c "SELECT to_regclass('endpoint_rollup') IS NOT NULL;" 2>/dev/null || echo f)
+  if [ "$E_TABLE" != "t" ]; then
+    bad "endpoints      endpoint_rollup is missing — the schema did not apply"
+    info "run the installer again; it is idempotent"
+  else
+    E_ROWS=$(pgq -c "SELECT count(*) FROM endpoint_rollup
+                     WHERE bucket > now() - interval '1 hour';" 2>/dev/null || echo 0)
+    if [ "${E_ROWS:-0}" -gt 0 ]; then
+      ok "endpoints      $E_ROWS route buckets in the last hour"
+      pgq -c "SELECT '                 ' || coalesce(method,'') || ' ' || route ||
+                     '  ' || sum(calls) || ' calls  ' ||
+                     round(100.0 * sum(errors) / NULLIF(sum(calls),0), 1) || '% err' ||
+                     coalesce('  p95 ' || round(max(p95_ms)::numeric, 0) || 'ms', '')
+              FROM endpoint_rollup
+              WHERE bucket > now() - interval '1 hour'
+              GROUP BY method, route
+              ORDER BY sum(calls) DESC LIMIT 5;" 2>/dev/null || true
+    elif [ "${R_ROUTE:-0}" -gt 0 ]; then
+      # Routes are being parsed but nothing has aggregated them yet.
+      info "endpoints      no rollup rows yet — the rollup timer runs every 5"
+      info "               minutes, or run: logagent rollup"
+    else
+      info "endpoints      no route was parsed from any line in the last hour."
+      info "               An endpoint appears once a log line carries both a"
+      info "               method and a URL, e.g. method=GET url=/leads/42"
+    fi
   fi
 
   # A partitioned table with no partition covering today rejects every insert.
