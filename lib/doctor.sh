@@ -229,6 +229,22 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   fi
 
   info "host samples   $(pgq -c "SELECT count(*) FROM host_metrics WHERE ts > now() - interval '10 minutes';" 2>/dev/null || echo 0) in 10 min"
+
+  # A partitioned table with no partition covering today rejects every insert.
+  # host_metrics and metrics are both partitioned, so one having rows and the
+  # other not is exactly what a missing partition looks like.
+  for t in log_entries metrics host_metrics; do
+    n=$(pgq -c "SELECT count(*) FROM pg_class c
+                JOIN pg_inherits i ON i.inhrelid = c.oid
+                JOIN pg_class p ON p.oid = i.inhparent
+                WHERE p.relname = '$t'
+                  AND c.relname >= '${t}_$(date -u +%Y_%m_%d)';" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 0 ]; then
+      info "partitions     $t: $n covering today onward"
+    else
+      bad "partitions     $t has NO partition for today — every insert is rejected"
+    fi
+  done
 else
   bad "container $PG_CONTAINER is not running"
 fi

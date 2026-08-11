@@ -109,7 +109,17 @@ free_bytes() { df -B1 --output=avail / | tail -1 | tr -d ' '; }
 gb()         { echo $(( ${1:-0} / 1024 / 1024 / 1024 )); }
 
 # psql inside the logs container. Quiet, tuple-only, unaligned — parseable output.
-pgq()  { docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -qtAX "$@" 2>/dev/null; }
+#
+# pg_run keeps stderr; pgq is the same thing with stderr discarded, which is what
+# most callers want because they parse the output and a warning would corrupt it.
+#
+# The split exists because the discard is not free: the metrics collector piped
+# its INSERTs through pgq and tried to capture failures with `2>&1` on the
+# outside, which cannot work — pgq had already sent stderr to /dev/null inside.
+# Statements that failed for every row were therefore indistinguishable from a
+# collector with nothing to insert.
+pg_run() { docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -qtAX "$@"; }
+pgq()    { pg_run "$@" 2>/dev/null; }
 # Same, but fails the script on SQL error. Use for migrations and DDL.
 pgx()  { docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 "$@"; }
 

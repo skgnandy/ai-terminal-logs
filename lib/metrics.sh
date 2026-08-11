@@ -128,11 +128,11 @@ main() {
     return 0
   fi
 
-  # psql errors were going to /dev/null, so a statement that failed for every
-  # row — a missing partition, a column type change — looked exactly like a
-  # collector that had nothing to say. Keep the output and record it.
+  # pg_run, not pgq: pgq discards stderr internally, so wrapping it in `2>&1`
+  # captured nothing and a statement failing for every row still looked like a
+  # collector with nothing to insert.
   local out
-  out=$(printf '%s\n' "$sql" | pgq 2>&1) || true
+  out=$(printf '%s\n' "$sql" | pg_run 2>&1) || true
   [ -n "$out" ] && printf '%s\n' "$out" >> "$ERR_LOG"
 
   # One file, overwritten each run, so the diagnostic reports what is wrong NOW
