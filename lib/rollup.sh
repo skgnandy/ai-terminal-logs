@@ -43,11 +43,36 @@ SELECT
   percentile_cont(0.99) WITHIN GROUP (ORDER BY dur),
   max(dur)
 FROM (
-  SELECT ts, host, service, severity,
-         CASE WHEN attrs->>'duration_ms' ~ '^[0-9]+(\.[0-9]+)?$'
-              THEN (attrs->>'duration_ms')::double precision END AS dur
-  FROM log_entries
-  WHERE ts > now() - interval '15 minutes'
+  SELECT e.ts, e.host, e.service, e.severity,
+         COALESCE(
+           CASE WHEN e.attrs->>'duration_ms' ~ '^[0-9]+(\.[0-9]+)?$'
+                THEN (e.attrs->>'duration_ms')::double precision END,
+           paired.dur
+         ) AS dur
+  FROM log_entries e
+  -- Latency from the PAIR of lines, for the many services that log
+  -- "Incoming request" and "Request completed" with a shared id and no
+  -- duration anywhere. The gap between the two IS the duration, so those
+  -- services get percentiles without a single change to their application.
+  --
+  -- LEFT JOIN LATERAL rather than joining two CTEs: it runs only for rows that
+  -- end a request, and stops at the first match.
+  LEFT JOIN LATERAL (
+    SELECT extract(epoch FROM (e.ts - s.ts)) * 1000 AS dur
+    FROM log_entries s
+    WHERE e.attrs->>'phase' = 'end'
+      AND s.attrs->>'phase' = 'start'
+      AND s.attrs->>'req_id' = e.attrs->>'req_id'
+      AND s.service = e.service
+      -- Bounded both ways. With no upper bound a recycled request id from hours
+      -- earlier would pair up and report a multi-hour "request"; with no lower
+      -- bound the join would scan every partition.
+      AND s.ts <= e.ts
+      AND s.ts > e.ts - interval '5 minutes'
+    ORDER BY s.ts DESC
+    LIMIT 1
+  ) paired ON true
+  WHERE e.ts > now() - interval '15 minutes'
 ) e
 GROUP BY 1, 2, 3
 ON CONFLICT (bucket, host, service) DO UPDATE SET

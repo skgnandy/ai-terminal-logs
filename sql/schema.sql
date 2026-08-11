@@ -226,3 +226,20 @@ SELECT * FROM (VALUES
 WHERE NOT EXISTS (SELECT 1 FROM alert_rules WHERE kind = 'cert_expiry');
 
 INSERT INTO schema_version (version) VALUES (2) ON CONFLICT DO NOTHING;
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- schema v3 — request pairing
+--
+-- Latency for services that log two lines per request ("Incoming request",
+-- "Request completed") sharing an id, and no duration anywhere. The rollup
+-- joins the pair on that id; without this index the join scans every partition
+-- once per five-minute run, which on a busy machine costs more than the rollup
+-- it serves.
+--
+-- Partial: only a request line carries req_id, and those are a small slice of a
+-- log. Indexing the rest would triple the index for rows it can never match.
+CREATE INDEX IF NOT EXISTS log_entries_reqid
+  ON log_entries ((attrs->>'req_id'))
+  WHERE attrs ? 'req_id';
+
+INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;

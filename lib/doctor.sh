@@ -239,7 +239,26 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   L_TOTAL=$(pgq -c "SELECT count(*) FROM log_entries WHERE ts > now() - interval '1 hour';" 2>/dev/null || echo 0)
   L_TIMED=$(pgq -c "SELECT count(*) FROM log_entries WHERE ts > now() - interval '1 hour' AND attrs ? 'duration_ms';" 2>/dev/null || echo 0)
 
-  if [ "${L_TIMED:-0}" -gt 0 ]; then
+  # Latency does not require a duration field. A service that logs a start and
+  # an end line sharing a request id has its timing in the gap between them, and
+  # the rollup derives it — so counting only duration_ms would report FAIL on a
+  # machine whose percentiles are about to appear.
+  L_PAIRS=$(pgq -c "SELECT count(*) FROM log_entries
+                    WHERE ts > now() - interval '1 hour' AND attrs->>'phase' = 'end';" 2>/dev/null || echo 0)
+
+  if [ "${L_TIMED:-0}" -eq 0 ] && [ "${L_PAIRS:-0}" -gt 0 ]; then
+    ok "latency        derived from ${L_PAIRS} request pairs in the last hour"
+    info "no duration field in these logs, but each request logs a start and an"
+    info "end sharing an id — the gap between them is the duration."
+    pgq -c "SELECT '                 ' || service || '  p50 ' ||
+                   round(percentile_cont(0.50) WITHIN GROUP (ORDER BY p95_ms)::numeric, 1) || 'ms  p95 ' ||
+                   round(max(p95_ms)::numeric, 1) || 'ms'
+            FROM log_rollup
+            WHERE bucket > now() - interval '1 hour' AND p95_ms IS NOT NULL
+            GROUP BY service ORDER BY 1;" 2>/dev/null || true
+    info "(blank above means the rollup has not run since the agent was updated;"
+    info " it runs every 5 minutes)"
+  elif [ "${L_TIMED:-0}" -gt 0 ]; then
     ok "latency        ${L_TIMED} of ${L_TOTAL} lines in the last hour carry a duration"
     pgq -c "SELECT '                 ' || service || '  p50 ' ||
                    round(percentile_cont(0.50) WITHIN GROUP (ORDER BY d)::numeric, 1) || 'ms  p95 ' ||

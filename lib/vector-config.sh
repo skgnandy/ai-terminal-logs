@@ -313,13 +313,66 @@ source = '''
   if st != null { status = to_int(st.c) ?? null }
   if status == null && http != null { status = to_int(http.code) ?? null }
 
+  # ── request pairing ──────────────────────────────────────────────────────
+  # Most loggers that print no duration still print TWO lines per request —
+  # "Incoming request" and "Request completed" — carrying the same request id.
+  # The duration is the gap between them, so tagging both ends here lets the
+  # rollup derive latency by joining on the id.
+  #
+  # This is the difference between "add a field to your application and wait for
+  # data to accumulate" and "your percentiles are already there". The reporter's
+  # own service logs exactly this shape and nothing else.
+  #
+  # Only the id and which end it is are recorded. Computing the difference
+  # belongs in the rollup: the two lines arrive seconds apart, in separate
+  # events, and a stream transform sees one event at a time.
+  rid = parse_regex(raw, r'(?i)\b(?:request_?id|req_?id|correlation_?id|trace_?id|x-request-id)"?\s*[=:]\s*"?(?P<v>[A-Za-z0-9_\-]{6,64})') ?? null
+
+  phase = null
+  if rid != null {
+    # Anchored on the message text, not on the presence of fields, because both
+    # ends carry the same fields — that is the whole point of the pair.
+    if match(raw, r'(?i)(incoming request|request (start|started|received|begin))') {
+      phase = "start"
+    } else if match(raw, r'(?i)(request (completed|complete|finished|end|ended)|response sent)') {
+      phase = "end"
+    }
+  }
+
+  method = null
+  mm = parse_regex(raw, r'(?i)\bmethod"?\s*[=:]\s*"?(?P<m>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b') ?? null
+  if mm != null { method = upcase(string!(mm.m)) }
+
+  # The route, with identifiers collapsed, so /leads/<uuid> and /leads/<other
+  # uuid> are one endpoint rather than thousands. Without this a "top endpoints"
+  # list is just a list of individual requests.
+  route = null
+  # No single quote in the class: VRL raw strings are themselves single-quoted,
+  # and escaping one through the shell heredoc that writes this file leaks the
+  # shell's own quoting into the regex.
+  uu = parse_regex(raw, r'(?i)\burl"?\s*[=:]\s*"?(?P<u>/[^\s",]*)') ?? null
+  if uu != null {
+    path = string!(uu.u)
+    path = replace(path, r'\?.*$', "")
+    path = replace(path, r'/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', "/:id")
+    path = replace(path, r'/[0-9a-fA-F]{16,}', "/:id")
+    path = replace(path, r'/\d+', "/:id")
+    route = path
+  }
+
   # Built as one object rather than assigned twice: a second `.attrs = {...}`
   # replaces the first, so writing status and duration separately would silently
   # drop whichever came first.
-  if ms != null || status != null {
+  if ms != null || status != null || phase != null || route != null {
     attrs = {}
     if ms != null     { attrs = set!(attrs, ["duration_ms"], ms) }
     if status != null { attrs = set!(attrs, ["status"], status) }
+    if method != null { attrs = set!(attrs, ["method"], method) }
+    if route != null  { attrs = set!(attrs, ["route"], route) }
+    if phase != null {
+      attrs = set!(attrs, ["phase"], phase)
+      attrs = set!(attrs, ["req_id"], string!(rid.v))
+    }
     .attrs = attrs
   }
 
