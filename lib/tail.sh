@@ -71,30 +71,69 @@ stream() {
 }
 
 # ── PM2 ──────────────────────────────────────────────────────────────────────
+#
+# ONE tail over every file, not one tail per file.
+#
+# `tail -F` holds an inotify instance per process, and fs.inotify.max_user_
+# instances defaults to 128. This machine has 65 PM2 logs; add the collector's
+# own file watches and Docker's, and a tail-per-file run silently gets nothing
+# past the limit. It reported "attached to 101 streams" and then never emitted a
+# line, because the failures went to the /dev/null this used to redirect to.
+#
+# With several files tail announces each switch as "==> path <==", so one
+# process still attributes every line correctly — including continuation lines,
+# which belong to whichever file is currently selected.
+FILES=()
 shopt -s nullglob
 for dir in /root/.pm2/logs /home/*/.pm2/logs; do
   [ -d "$dir" ] || continue
   for f in "$dir"/*.log; do
-    svc=$(svc_of_file "$f")
-    wanted "$svc" || continue
-    # -n 0: start at the end. A live view must open on what is happening now,
-    # not replay a 200 MB file. -F follows across rotation.
-    tail -F -n 0 "$f" 2>/dev/null | stream "$svc" &
-    PIDS+=($!)
+    wanted "$(svc_of_file "$f")" || continue
+    FILES+=("$f")
   done
 done
 shopt -u nullglob
 
+if [ ${#FILES[@]} -gt 0 ]; then
+  # -n 0: start at the end. A live view opens on what is happening now, not on a
+  # replay of a 200 MB file. -F follows across rotation.
+  #
+  # stderr is kept and tagged rather than discarded. Hiding it is what made the
+  # inotify exhaustion above invisible.
+  tail -F -n 0 "${FILES[@]}" 2>&1 | awk '
+    function svcname(p,  b) {
+      b = p
+      sub(/^.*\//, "", b)
+      sub(/-(out|error)(-[0-9]+)?\.log$/, "", b)
+      return b
+    }
+    /^==> .* <==$/ {
+      p = $0; sub(/^==> /, "", p); sub(/ <==$/, "", p)
+      svc = svcname(p); next
+    }
+    /^$/ { next }
+    /^tail:/ { print "__warn__\t" $0; fflush(); next }
+    { print (svc == "" ? "pm2" : svc) "\t" $0; fflush() }
+  ' &
+  PIDS+=($!)
+fi
+
 # ── Docker ───────────────────────────────────────────────────────────────────
+CONTAINERS=0
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     [ "$name" = "$PG_CONTAINER" ] && continue   # our own logs database
     wanted "$name" || continue
-    # 2>&1 because most containers log to stderr, and a tail that silently drops
-    # stderr shows an idle-looking container that is in fact erroring.
+    # One process per container is unavoidable — `docker logs -f` takes a single
+    # container — but there are a handful of these, not dozens, so the inotify
+    # pressure that forced the PM2 tails into one process does not apply.
+    #
+    # 2>&1 because most containers log to stderr, and dropping it shows an
+    # idle-looking container that is in fact erroring.
     docker logs -f --tail 0 "$name" 2>&1 | stream "$name" &
     PIDS+=($!)
+    CONTAINERS=$((CONTAINERS + 1))
   done < <(docker ps --format '{{.Names}}' 2>/dev/null)
 fi
 
@@ -103,8 +142,9 @@ if [ ${#PIDS[@]} -eq 0 ]; then
   exit 0
 fi
 
-# Tell the app what it is watching before the first line arrives, so a set of
-# genuinely idle services reads as "attached, nothing yet" rather than a hang.
-echo "__attached__	${#PIDS[@]}"
+# Report what is being watched, not how many processes are doing the watching.
+# The previous count was the process count, which after collapsing the PM2 tails
+# into one would have reported "2 streams" for a machine with 65 log files.
+echo "__attached__	$(( ${#FILES[@]} + CONTAINERS ))"
 
 wait
