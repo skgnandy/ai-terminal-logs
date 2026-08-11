@@ -39,30 +39,13 @@ collect_pm2() {
   for home in /root/.pm2 /home/*/.pm2; do
     [ -d "$home" ] || continue
     found=1
-    PM2_HOME="$home" "$pm2_bin" jlist 2>>"$ERR_LOG" | python3 - "$HOST_NAME" <<'PY' || true
-import json, sys
-host = sys.argv[1]
-try:
-    procs = json.load(sys.stdin)
-except Exception:
-    procs = []
-for p in procs:
-    monit = p.get("monit") or {}
-    env = p.get("pm2_env") or {}
-    name = str(p.get("name", "")).replace("'", "''")
-    if not name:
-        continue
-    print(
-        "INSERT INTO metrics(ts,host,service,kind,cpu,mem_bytes,restarts,status) "
-        "VALUES(now(),'{h}','{n}','pm2',{c},{m},{r},'{s}');".format(
-            h=host, n=name,
-            c=float(monit.get("cpu") or 0),
-            m=int(monit.get("memory") or 0),
-            r=int(env.get("restart_time") or 0),
-            s=str(env.get("status", "")).replace("'", "''"),
-        )
-    )
-PY
+    # The parser is a file, not a heredoc. `python3 - <<'PY'` reads its program
+    # from stdin, so the heredoc took the stdin the pipe needed: pm2 wrote into
+    # a pipe with no reader and died with EPIPE, and the parser tried to read
+    # JSON from its own already-consumed source text. Every PM2 service showed
+    # blank cpu and memory while every check upstream passed.
+    PM2_HOME="$home" "$pm2_bin" jlist 2>>"$ERR_LOG" \
+      | python3 "$LIB_DIR/pm2-metrics.py" "$HOST_NAME" 2>>"$ERR_LOG" || true
   done
   [ "$found" -eq 1 ] || note "pm2 found at $pm2_bin but no .pm2 directory under /root or /home/*"
 }
@@ -76,39 +59,11 @@ collect_docker() {
   local health_map
   health_map=$(docker ps --format '{{.Names}}|{{.Status}}' 2>>"$ERR_LOG" || true)
 
+  # Same heredoc-versus-pipe trap as the PM2 collector above — see the comment
+  # there. This one lost every container's cpu and memory the same way.
   docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' 2>>"$ERR_LOG" \
-  | python3 - "$HOST_NAME" "$PG_CONTAINER" "$health_map" <<'PY' || true
-import re, sys
-host, skip, health_raw = sys.argv[1], sys.argv[2], sys.argv[3]
-
-health = {}
-for line in health_raw.splitlines():
-    if "|" in line:
-        n, s = line.split("|", 1)
-        health[n] = ("unhealthy" if "unhealthy" in s else
-                     "healthy" if "healthy" in s else "running")
-
-UNITS = {"B": 1, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "KB": 1000, "MB": 1000**2, "GB": 1000**3}
-
-def to_bytes(text):
-    m = re.match(r"([\d.]+)\s*([A-Za-z]+)", text.strip())
-    if not m:
-        return 0
-    return int(float(m.group(1)) * UNITS.get(m.group(2).upper(), 1))
-
-for line in sys.stdin:
-    parts = line.strip().split("|")
-    if len(parts) < 3 or parts[0] == skip:
-        continue
-    name = parts[0].replace("'", "''")
-    cpu = float(parts[1].replace("%", "") or 0)
-    mem = to_bytes(parts[2].split("/")[0])
-    status = health.get(parts[0], "running")
-    print(
-        "INSERT INTO metrics(ts,host,service,kind,cpu,mem_bytes,status) "
-        f"VALUES(now(),'{host}','{name}','docker',{cpu},{mem},'{status}');"
-    )
-PY
+    | python3 "$LIB_DIR/docker-metrics.py" "$HOST_NAME" "$PG_CONTAINER" "$health_map" \
+        2>>"$ERR_LOG" || true
 }
 
 main() {
