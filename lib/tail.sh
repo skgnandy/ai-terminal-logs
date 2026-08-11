@@ -120,6 +120,7 @@ fi
 
 # ── Docker ───────────────────────────────────────────────────────────────────
 CONTAINERS=0
+WATCHED_CONTAINERS=()
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   while IFS= read -r name; do
     [ -n "$name" ] || continue
@@ -134,6 +135,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     docker logs -f --tail 0 "$name" 2>&1 | stream "$name" &
     PIDS+=($!)
     CONTAINERS=$((CONTAINERS + 1))
+    WATCHED_CONTAINERS+=("$name")
   done < <(docker ps --format '{{.Names}}' 2>/dev/null)
 fi
 
@@ -146,5 +148,20 @@ fi
 # The previous count was the process count, which after collapsing the PM2 tails
 # into one would have reported "2 streams" for a machine with 65 log files.
 echo "__attached__	$(( ${#FILES[@]} + CONTAINERS ))"
+
+# The full roster, so the app can offer every watched service straight away.
+#
+# Deriving the picker from lines already seen means a service that has not
+# spoken yet cannot be selected — and on a quiet box that is most of them. It is
+# also backwards: the reason to filter to one service is usually that it has
+# gone silent and you want to confirm it.
+#
+# Deduplicated because -out.log and -error.log are the same service, and cluster
+# mode adds a -<pm_id> file per worker.
+printf '__services__\t%s\n' "$(
+  { for f in ${FILES[@]+"${FILES[@]}"}; do svc_of_file "$f"; done
+    printf '%s\n' ${WATCHED_CONTAINERS[@]+"${WATCHED_CONTAINERS[@]}"}
+  } | grep -v '^$' | sort -u | paste -sd, -
+)"
 
 wait
