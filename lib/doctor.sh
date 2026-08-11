@@ -295,10 +295,24 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   R_ROUTE=$(pgq -c "SELECT count(*) FROM log_entries
                     WHERE ts > now() - interval '1 hour' AND attrs ? 'route';" 2>/dev/null || echo 0)
 
-  if [ "${FRESH:-0}" -eq 0 ] && [ -n "$SINCE_UTC" ]; then
+  # Seconds since the collector came up. A restart a moment ago with no rows yet
+  # is normal — batches land every few seconds, and pm2 file sources resume from
+  # a checkpoint. Warning about it told the reader to disregard an hour of valid
+  # data below, which is worse than saying nothing.
+  UP_SECS=0
+  if [ -n "$SINCE" ]; then
+    SINCE_EPOCH=$(date -d "$SINCE" +%s 2>/dev/null || echo 0)
+    [ "${SINCE_EPOCH:-0}" -gt 0 ] && UP_SECS=$(( $(date +%s) - SINCE_EPOCH ))
+  fi
+
+  if [ "${FRESH:-0}" -eq 0 ] && [ -n "$SINCE_UTC" ] && [ "$UP_SECS" -gt 120 ]; then
     info "no rows at all since the collector restarted ($SINCE)."
     info "Nothing has been through the current parser yet — wait a minute for"
     info "the next batch and run this again before reading anything below."
+  elif [ "${FRESH:-0}" -eq 0 ] && [ -n "$SINCE_UTC" ]; then
+    info "collector restarted ${UP_SECS}s ago; nothing has arrived through it"
+    info "yet, which is expected. The figures below cover the last hour and are"
+    info "unaffected."
   fi
 
   if [ "${L_TIMED:-0}" -eq 0 ] && [ "${L_PAIRS:-0}" -gt 0 ]; then
@@ -430,15 +444,26 @@ except Exception:
 PY
 )
   NOW_EPOCH=$(date +%s)
-  printf '%s\n' "$SERVICES_LIST" | while IFS= read -r svc; do
+
+  # Read into an array, NOT `printf … | while read`. pgq is `docker exec -i`,
+  # which attaches stdin and drains it — inside a read loop fed by a pipe it
+  # consumes the remaining service names, so the loop ran exactly once and the
+  # section listed one service out of six while looking complete.
+  mapfile -t SELECTED < <(printf '%s\n' "$SERVICES_LIST")
+
+  for svc in "${SELECTED[@]}"; do
     [ -n "$svc" ] || continue
 
     # Doubling the quote is the SQL escape for a literal quote. These names come
     # from pm2 on this machine rather than from us, so they are not trusted into
     # a query unescaped even though doctor already runs as root.
+    #
+    # </dev/null belongs here for the same reason as the array above: it is what
+    # makes the loop independent of whatever stdin the script was given.
     esc=$(printf '%s' "$svc" | sed "s/'/''/g")
     rows=$(pgq -c "SELECT count(*) FROM log_entries
-                   WHERE service = '$esc' AND ts > now() - interval '1 hour';" 2>/dev/null || echo 0)
+                   WHERE service = '$esc' AND ts > now() - interval '1 hour';" \
+                 </dev/null 2>/dev/null || echo 0)
 
     newest=$(find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f \
                \( -name "$svc-out*.log" -o -name "$svc-error*.log" -o -name "$svc.log" \) \
