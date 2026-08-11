@@ -141,7 +141,22 @@ for d in /root/.pm2/logs /home/*/.pm2/logs; do
   info "pm2 logs       $d  ($n files)"
   # Recent writes matter more than file count: a directory full of logs nothing
   # writes to any more explains an empty log view with read_from = "end".
-  find "$d" -name '*.log' -type f -mmin -10 2>/dev/null | head -5 | sed 's/^/                 recently written: /'
+  #
+  # Sorted by mtime and counted. The first version piped `find` straight into
+  # `head -5`, and find emits directory order — so the five shown were an
+  # arbitrary five of however many, while reading exactly like the complete
+  # list. That is worse than showing nothing: it was used to conclude one
+  # service was the only one writing, which the output could not support.
+  RECENT=$(find "$d" -name '*.log' -type f -mmin -10 -printf '%T@ %p\n' 2>/dev/null \
+           | sort -rn | cut -d' ' -f2-)
+  RECENT_N=$(printf '%s' "$RECENT" | grep -c . || true)
+  if [ "${RECENT_N:-0}" -eq 0 ]; then
+    info "               nothing written here in the last 10 minutes"
+  else
+    printf '%s\n' "$RECENT" | head -8 \
+      | sed 's/^/                 recently written: /'
+    [ "$RECENT_N" -gt 8 ] && info "                 … and $((RECENT_N - 8)) more (newest first)"
+  fi
 done
 [ "$PM2_FILES" -eq 0 ] && info "pm2 logs       none found"
 
@@ -388,8 +403,64 @@ FROM (
 ) s
 ORDER BY lines DESC;
 SQL
-  info "any configured service missing from that list stored no line at all in"
-  info "the last hour — nothing can be derived from a service that is silent."
+  # ── selected services ──────────────────────────────────────────────────────
+  #
+  # Every service the operator selected, listed whether or not it stored a line.
+  # The breakdown above can only report services that HAVE rows, so a service
+  # that stored nothing simply vanished from the output — which is precisely the
+  # service someone is looking for when they ask why it is missing.
+  #
+  # For each one, the row count and the evidence that explains it: when its log
+  # file was last written, or that no file bears its name at all. That last case
+  # is the only one that is a fault rather than an idle service, and it was
+  # indistinguishable from silence before.
+  info "selected services (last hour)"
+  SERVICES_LIST=$(python3 - "$CONF" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    for s in (json.load(open(sys.argv[1])).get("logServices") or []):
+        if s:
+            print(s)
+except Exception:
+    pass
+PY
+)
+  NOW_EPOCH=$(date +%s)
+  printf '%s\n' "$SERVICES_LIST" | while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+
+    # Doubling the quote is the SQL escape for a literal quote. These names come
+    # from pm2 on this machine rather than from us, so they are not trusted into
+    # a query unescaped even though doctor already runs as root.
+    esc=$(printf '%s' "$svc" | sed "s/'/''/g")
+    rows=$(pgq -c "SELECT count(*) FROM log_entries
+                   WHERE service = '$esc' AND ts > now() - interval '1 hour';" 2>/dev/null || echo 0)
+
+    newest=$(find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f \
+               \( -name "$svc-out*.log" -o -name "$svc-error*.log" -o -name "$svc.log" \) \
+               -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -1)
+
+    if [ -n "$newest" ]; then
+      mtime=${newest%%.*}
+      size=$(printf '%s' "$newest" | awk '{print $2}')
+      age=$(( NOW_EPOCH - mtime ))
+      if   [ "$age" -lt 120 ]   ; then when="${age}s ago"
+      elif [ "$age" -lt 7200 ]  ; then when="$((age / 60))m ago"
+      elif [ "$age" -lt 172800 ]; then when="$((age / 3600))h ago"
+      else                            when="$((age / 86400))d ago"
+      fi
+      detail="log written $when, ${size} bytes"
+      # A file that has not been touched in an hour cannot produce rows in the
+      # last hour. Saying so removes the only other suspect.
+      [ "${rows:-0}" -eq 0 ] && [ "$age" -gt 3600 ] && detail="$detail — service is silent"
+    elif docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF "$svc"; then
+      detail="docker container — logs come from the docker socket, not a file"
+    else
+      detail="NO log file matching $svc-*.log — check the pm2 process name"
+    fi
+
+    printf '                 %-32s %6s rows   %s\n' "$svc" "${rows:-0}" "$detail"
+  done
 
   # ── endpoints ──────────────────────────────────────────────────────────────
   #
