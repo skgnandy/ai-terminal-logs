@@ -282,7 +282,11 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
         count(*) FILTER (WHERE attrs ? 'method') || ' method, ' ||
         count(*) FILTER (WHERE attrs ? 'route')  || ' route, ' ||
         count(*) FILTER (WHERE attrs->>'phase' = 'start') || ' start, ' ||
-        count(*) FILTER (WHERE attrs->>'phase' = 'end')   || ' end'
+        count(*) FILTER (WHERE attrs->>'phase' = 'end')   || ' end, ' ||
+        -- Should exceed start+end once the agent tags every line that carries
+        -- an id, not only the two that bracket the request. The gap between
+        -- this and start+end is what the single-request view has to show.
+        count(*) FILTER (WHERE attrs ? 'req_id') || ' req_id'
       FROM log_entries WHERE ts > now() - interval '1 hour';" 2>/dev/null || echo '?') (last hour)"
 
   # Read on its own as well as inside that line: the endpoints check below needs

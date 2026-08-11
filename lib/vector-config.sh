@@ -363,16 +363,19 @@ source = '''
   # Built as one object rather than assigned twice: a second `.attrs = {...}`
   # replaces the first, so writing status and duration separately would silently
   # drop whichever came first.
-  if ms != null || status != null || phase != null || route != null {
+  if ms != null || status != null || phase != null || route != null || rid != null {
     attrs = {}
     if ms != null     { attrs = set!(attrs, ["duration_ms"], ms) }
     if status != null { attrs = set!(attrs, ["status"], status) }
     if method != null { attrs = set!(attrs, ["method"], method) }
     if route != null  { attrs = set!(attrs, ["route"], route) }
-    if phase != null {
-      attrs = set!(attrs, ["phase"], phase)
-      attrs = set!(attrs, ["req_id"], string!(rid.v))
-    }
+    # The id goes on EVERY line that carries one, not only on the two that open
+    # and close the request. Tagging just the ends was enough to derive latency,
+    # but it made "show me everything that happened during this request" return
+    # exactly two lines — with the query it was written for, the work in
+    # between, which is the reason anyone opens a single request, was invisible.
+    if rid != null    { attrs = set!(attrs, ["req_id"], string!(rid.v)) }
+    if phase != null  { attrs = set!(attrs, ["phase"], phase) }
     .attrs = attrs
   }
 
