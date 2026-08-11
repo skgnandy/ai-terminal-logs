@@ -252,10 +252,15 @@ source = '''
     if contains(raw, "❌") || contains(raw, "🔴") { sev = "ERROR" }
   }
 
+  # Declared out here, not inside the branch below. VRL scopes a variable to the
+  # block it is assigned in, so a value produced inside `if sev == null` does not
+  # exist afterwards — reading it later is error[E701]: undefined variable, and
+  # the whole config is rejected.
+  http = parse_regex(raw, r'\((?P<ms>\d+) ms\)\s+(?P<code>\d{3})\s*$') ?? null
+
   # HTTP access lines carry no level. Derive one from the status code so they
   # are filterable instead of an undifferentiated wall of INFO.
   if sev == null {
-    http = parse_regex(raw, r'\((?P<ms>\d+) ms\)\s+(?P<code>\d{3})\s*$') ?? null
     if http != null {
       code = to_int(http.code) ?? 0
       sev = if code >= 500 { "ERROR" } else if code >= 400 { "WARN" } else { "INFO" }

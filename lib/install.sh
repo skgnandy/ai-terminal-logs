@@ -167,8 +167,21 @@ bash "$PREFIX/lib/partitions.sh" >/dev/null 2>&1 || warn "initial partition crea
 # a configured machine regenerated the config, started the collector, and then
 # immediately killed it. The machine then read as configured and unpaused with
 # nothing being collected.
-bash "$PREFIX/lib/vector-config.sh" >/dev/null \
-  || warn "collection is not running — see above"
+#
+# The failure message distinguishes two very different outcomes, because the
+# previous one asserted the worse of them and was then contradicted by the
+# report a few lines below saying COLLECTING. A rejected config is NOT lost
+# collection: generate() keeps the old file and never reaches the restart, so
+# the collector carries on with what it already had. What is lost is the change.
+if ! bash "$PREFIX/lib/vector-config.sh" >/dev/null; then
+  if systemctl is-active --quiet vector; then
+    warn "the new collector config was rejected — see above."
+    warn "the collector is still running the PREVIOUS config, so collection"
+    warn "continues, but this update's parser changes have NOT taken effect."
+  else
+    warn "collection is not running — see above"
+  fi
+fi
 
 # Seed the rollup so the dashboard is not blank the first time it is opened.
 bash "$PREFIX/lib/rollup.sh" >/dev/null 2>&1 || true
