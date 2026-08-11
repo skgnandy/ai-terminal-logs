@@ -246,6 +246,36 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   L_PAIRS=$(pgq -c "SELECT count(*) FROM log_entries
                     WHERE ts > now() - interval '1 hour' AND attrs->>'phase' = 'end';" 2>/dev/null || echo 0)
 
+  # What the parser is actually producing, and whether anything has been through
+  # it yet. Without this, "no timings" after an update is ambiguous between a
+  # parser that is not extracting and a collector that has simply not ingested a
+  # line since it restarted thirty seconds ago — and the previous wording
+  # asserted the first, blaming the application for a fix that had just shipped.
+  SINCE=$(systemctl show vector -p ActiveEnterTimestamp --value 2>/dev/null || true)
+  # Computed first, not inlined into the SQL: a command substitution nested
+  # inside a quoted query is exactly where quoting breaks silently, and a
+  # broken timestamp here would be read as "no fresh rows" on every machine.
+  SINCE_UTC=""
+  [ -n "$SINCE" ] && SINCE_UTC=$(date -d "$SINCE" -u '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+
+  FRESH=0
+  if [ -n "$SINCE_UTC" ]; then
+    FRESH=$(pgq -c "SELECT count(*) FROM log_entries WHERE ts > timestamptz '${SINCE_UTC}+00';" 2>/dev/null || echo 0)
+  fi
+  info "parser output   $(pgq -c "SELECT
+        count(*) FILTER (WHERE attrs ? 'status') || ' status, ' ||
+        count(*) FILTER (WHERE attrs ? 'method') || ' method, ' ||
+        count(*) FILTER (WHERE attrs ? 'route')  || ' route, ' ||
+        count(*) FILTER (WHERE attrs->>'phase' = 'start') || ' start, ' ||
+        count(*) FILTER (WHERE attrs->>'phase' = 'end')   || ' end'
+      FROM log_entries WHERE ts > now() - interval '1 hour';" 2>/dev/null || echo '?') (last hour)"
+
+  if [ "${FRESH:-0}" -eq 0 ] && [ -n "$SINCE_UTC" ]; then
+    info "no rows at all since the collector restarted ($SINCE)."
+    info "Nothing has been through the current parser yet — wait a minute for"
+    info "the next batch and run this again before reading anything below."
+  fi
+
   if [ "${L_TIMED:-0}" -eq 0 ] && [ "${L_PAIRS:-0}" -gt 0 ]; then
     ok "latency        derived from ${L_PAIRS} request pairs in the last hour"
     info "no duration field in these logs, but each request logs a start and an"
@@ -294,11 +324,18 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
       printf '%s\n' "$FOUND"
       info "^ one of these holds the request duration but the extractor did not"
       info "  read it. Report the names — the parser needs to learn them."
+    elif [ "${FRESH:-0}" -eq 0 ]; then
+      # Do not blame the application for a machine that has not ingested a line
+      # since the parser changed. The previous wording did, immediately after
+      # shipping the fix that made the blame wrong.
+      info "          (nothing has been through the current parser yet)"
     else
       info "          (none — no field anywhere holds a numeric duration)"
-      info "the application never records how long a request took, so no parser"
-      info "change can produce a percentile. Add one field where the request is"
-      info "logged, for example responseTime: Date.now() - start"
+      info "no duration field, and no start/end pair to derive one from. Either"
+      info "log a duration where the request completes —"
+      info "  responseTime: Date.now() - start"
+      info "— or log a line when the request ARRIVES carrying the same request"
+      info "id, and the gap between the two becomes the duration automatically."
     fi
 
     # Whole records, untruncated, so the shape can be read rather than guessed.
