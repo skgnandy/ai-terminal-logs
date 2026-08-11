@@ -319,12 +319,39 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
     ok "latency        derived from ${L_PAIRS} request pairs in the last hour"
     info "no duration field in these logs, but each request logs a start and an"
     info "end sharing an id — the gap between them is the duration."
-    pgq -c "SELECT '                 ' || service || '  p50 ' ||
-                   round(percentile_cont(0.50) WITHIN GROUP (ORDER BY p95_ms)::numeric, 1) || 'ms  p95 ' ||
-                   round(max(p95_ms)::numeric, 1) || 'ms'
-            FROM log_rollup
-            WHERE bucket > now() - interval '1 hour' AND p95_ms IS NOT NULL
-            GROUP BY service ORDER BY 1;" 2>/dev/null || true
+    # Both figures used to be wrong, and wrong in a way that read as precise.
+    #
+    #   "p95" was max(p95_ms) — the worst five-minute bucket in the hour, not
+    #   the hour's p95. One quiet bucket containing a single slow request set
+    #   it, so it stayed pinned at that value while the real distribution moved
+    #   underneath. Two consecutive runs printing an identical 2587.1ms is what
+    #   gave it away.
+    #
+    #   "p50" was percentile_cont(0.50) ORDER BY p95_ms — the median of the
+    #   bucket p95 VALUES. It never read p50_ms at all.
+    #
+    # Both are now averaged across buckets weighted by the requests in each, so
+    # a bucket with two requests cannot outvote one with two hundred. The worst
+    # bucket is still shown, labelled as what it is: it is the useful half of
+    # the old number, and dropping it would hide a real spike.
+    pgq -f - <<'SQL' 2>/dev/null || true
+SELECT '                 ' || service ||
+       '  p50 ' || round((sum(p50_ms * w) /
+                     nullif(sum(w) FILTER (WHERE p50_ms IS NOT NULL), 0))::numeric, 1) || 'ms' ||
+       '  p95 ' || round((sum(p95_ms * w) /
+                     nullif(sum(w) FILTER (WHERE p95_ms IS NOT NULL), 0))::numeric, 1) || 'ms' ||
+       '  worst 5m bucket ' || round(max(p95_ms)::numeric, 1) || 'ms'
+FROM (
+  -- greatest(timed,1): a rollup written before schema v5 has timed = 0, and
+  -- weighting everything by zero would divide the whole line by nothing. Falls
+  -- back to an unweighted average, which is what the data can support.
+  SELECT service, p50_ms, p95_ms, greatest(coalesce(timed, 0), 1) AS w
+  FROM log_rollup
+  WHERE bucket > now() - interval '1 hour' AND p95_ms IS NOT NULL
+) s
+GROUP BY service
+ORDER BY 1;
+SQL
     info "(blank above means the rollup has not run since the agent was updated;"
     info " it runs every 5 minutes)"
   elif [ "${L_TIMED:-0}" -gt 0 ]; then
