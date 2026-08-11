@@ -251,16 +251,38 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
             GROUP BY service ORDER BY 1;" 2>/dev/null || true
   else
     bad "latency        no line in the last hour carries a duration — p50/p95/p99 will be blank"
-    # The decisive evidence: what a request line on THIS machine actually looks
-    # like. If it has no timing field, no parser change can produce a percentile
-    # and the fix belongs in the application's logger.
-    info "sample request lines, so the shape can be read rather than guessed:"
-    pgq -c "SELECT '          ' || left(regexp_replace(body, E'[\n\r]+', ' | ', 'g'), 180)
+
+    # Which of the two causes is it: the parser missing a field that IS there,
+    # or an application that never logs one? Scan for any key that looks like a
+    # timing rather than eyeballing samples — the first version of this check
+    # printed 180 characters of each line, which on a multi-field record cut off
+    # before the end and so could not answer the question it was asked.
+    info "timing-like fields present in the last hour:"
+    FOUND=$(pgq -c "SELECT DISTINCT '          ' || m[1]
+            FROM log_entries,
+                 LATERAL regexp_matches(body,
+                   '([A-Za-z_.]*(?:[Tt]ime|[Dd]uration|[Ee]lapsed|[Ll]atency|[Rr]esponse)[A-Za-z_.]*)\"?\s*[=:]', 'g') AS m
+            WHERE ts > now() - interval '1 hour'
+            LIMIT 20;" 2>/dev/null || true)
+    if [ -n "$FOUND" ]; then
+      printf '%s\n' "$FOUND"
+      info "^ a field above holds the timing but the parser did not read it."
+      info "  Report these names — the extractor needs to learn them."
+    else
+      info "          (none — no field in any log line looks like a timing)"
+      info "the application never records how long a request took, so no parser"
+      info "change can produce a percentile. Add one field where the request is"
+      info "logged, for example responseTime: Date.now() - start"
+    fi
+
+    # Whole records, untruncated, so the shape can be read rather than guessed.
+    info "a recent request record in full:"
+    pgq -c "SELECT '          ' || replace(body, E'\n', E'\n          ')
             FROM log_entries
             WHERE ts > now() - interval '6 hours'
               AND (body ILIKE '%request completed%' OR body ILIKE '%statusCode%'
-                   OR body ILIKE '%HTTP/1.%' OR body ILIKE '% ms%')
-            ORDER BY ts DESC LIMIT 5;" 2>/dev/null || true
+                   OR body ILIKE '%HTTP/1.%')
+            ORDER BY ts DESC LIMIT 2;" 2>/dev/null || true
   fi
 
   # A partitioned table with no partition covering today rejects every insert.
