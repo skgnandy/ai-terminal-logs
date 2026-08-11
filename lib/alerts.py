@@ -16,8 +16,9 @@ Two design rules matter more than the individual checks:
 Coverage is deliberately uneven and the app is told so via `logagent alerts
 --coverage`: metric rules (crash_loop, service_down, unhealthy, disk, cpu,
 memory, cert_expiry) cover every discovered service, while log rules
-(error_rate, latency_p95) only cover services with logging enabled. A
-half-monitored service must never read as fully covered.
+(error_rate, latency_p95, endpoint_latency, endpoint_errors, traffic_drop) only
+cover services with logging enabled. A half-monitored service must never read
+as fully covered.
 """
 from __future__ import annotations
 
@@ -179,6 +180,83 @@ def cond_latency_p95(threshold: float, window: int) -> list[list[str]]:
     """)
 
 
+def cond_endpoint_latency(threshold: float, window: int) -> list[list[str]]:
+    """Any single endpoint slower than the threshold.
+
+    Distinct from latency_p95, which is per service and therefore averages the
+    one slow endpoint away: a service whose p95 is 300 ms can contain a route
+    sitting at 9 seconds, and that route is what wakes someone at 3 a.m.
+
+    The key carries the operation, so the notification names the endpoint
+    rather than the service that happens to contain it.
+    """
+    return q(f"""
+        SELECT service || '  ' || btrim(method || ' ' || route),
+               round(max(p95_ms)::numeric)::text
+        FROM endpoint_rollup
+        WHERE bucket > now() - interval '{window} seconds' AND p95_ms IS NOT NULL
+        GROUP BY service, method, route
+        -- A minimum call count, or one slow request on a rarely-used route
+        -- pages someone. Percentiles over a handful of samples are not
+        -- percentiles.
+        HAVING sum(calls) >= 5 AND max(p95_ms) > {threshold}
+    """)
+
+
+def cond_endpoint_errors(threshold: float, window: int) -> list[list[str]]:
+    """An endpoint failing more than the threshold percentage of its calls.
+
+    A RATE, not a count: the endpoint called twice a minute that fails every
+    time is a bigger problem than the one called ten thousand times that fails
+    fifty, and a count alert only ever finds the second.
+
+    4xx is excluded — errors here is 5xx and lines the parser judged ERROR.
+    Counting a scanner's 404s would make this fire on traffic nobody controls.
+    """
+    return q(f"""
+        SELECT service || '  ' || btrim(method || ' ' || route),
+               round(100.0 * sum(errors) / nullif(sum(calls), 0))::text
+        FROM endpoint_rollup
+        WHERE bucket > now() - interval '{window} seconds'
+        GROUP BY service, method, route
+        HAVING sum(calls) >= 10
+           AND 100.0 * sum(errors) / nullif(sum(calls), 0) > {threshold}
+    """)
+
+
+def cond_traffic_drop(threshold: float, window: int) -> list[list[str]]:
+    """Requests well below the same window one week earlier.
+
+    The failure no threshold catches: nothing errors, nothing restarts, latency
+    is excellent — because almost no traffic is arriving. A load balancer
+    pointed elsewhere, a DNS change, an expired client credential all look
+    perfectly healthy on every other check here.
+
+    Week-over-week rather than against the previous hour, because traffic has a
+    daily shape: comparing 3 a.m. against 2 a.m. reports an outage every night.
+    """
+    return q(f"""
+        WITH current AS (
+          SELECT service, sum(timed) AS n FROM log_rollup
+          WHERE bucket > now() - interval '{window} seconds'
+          GROUP BY service
+        ), baseline AS (
+          SELECT service, sum(timed) AS n FROM log_rollup
+          WHERE bucket >  now() - interval '7 days' - interval '{window} seconds'
+            AND bucket <= now() - interval '7 days'
+          GROUP BY service
+        )
+        SELECT c.service,
+               round(100.0 * (b.n - c.n) / nullif(b.n, 0))::text
+        FROM current c JOIN baseline b USING (service)
+        -- A quiet baseline makes any dip look catastrophic. Below this the
+        -- comparison is noise, and a machine with under a week of history has
+        -- no baseline row at all, so it cannot fire.
+        WHERE b.n >= 100
+          AND 100.0 * (b.n - c.n) / nullif(b.n, 0) > {threshold}
+    """)
+
+
 def cond_cert_expiry(threshold: float, _w: int) -> list[list[str]]:
     return q(f"""
         SELECT domain, days_left::text FROM cert_expiry
@@ -195,6 +273,9 @@ CONDITIONS = {
     "cpu": cond_cpu,
     "memory": cond_memory,
     "latency_p95": cond_latency_p95,
+    "endpoint_latency": cond_endpoint_latency,
+    "endpoint_errors": cond_endpoint_errors,
+    "traffic_drop": cond_traffic_drop,
     "cert_expiry": cond_cert_expiry,
 }
 
@@ -207,8 +288,45 @@ MESSAGES = {
     "cpu":          "{service}: CPU {value}% sustained",
     "memory":       "{service}: memory {value}% of host",
     "latency_p95":  "{service}: p95 latency {value} ms",
+    # `service` here already carries the operation, so these read as
+    # "api  GET /leads/:id: p95 latency 9400 ms".
+    "endpoint_latency": "{service}: p95 latency {value} ms",
+    "endpoint_errors":  "{service}: {value}% of calls failing",
+    "traffic_drop":     "{service}: requests {value}% below the same {window} last week",
     "cert_expiry":  "{service}: TLS certificate expires in {value} days",
 }
+
+
+# Kinds whose key is not a service name. `disk` reports the machine under a
+# fixed sentinel and `cert_expiry` reports a domain, so filtering either by
+# service name would silence it entirely.
+HOST_KINDS = {"disk", "cert_expiry"}
+
+# What separates a service from the operation inside it in an endpoint key —
+# see cond_endpoint_latency. Written once here because the scope filter has to
+# split on exactly what those queries joined with.
+KEY_SEP = "  "
+
+
+def scoped(kind: str, scope: str, firing: dict[str, str]) -> dict[str, str]:
+    """Restrict a rule's results to the service it was scoped to.
+
+    Rules carry `target.service`, which the evaluator did not read: a rule
+    created for one service fired for every service, and the scope picker in
+    the app was decorative. Rules still GROUP BY service in SQL — the scope is
+    applied to the result, so a rule left at `*` keeps covering services that
+    did not exist when it was written.
+
+    Endpoint kinds key on `service<sep>METHOD /route`, so a service scope has
+    to match the prefix rather than the whole key.
+    """
+    if scope == "*" or kind in HOST_KINDS:
+        return firing
+    return {
+        key: value
+        for key, value in firing.items()
+        if key == scope or key.startswith(scope + KEY_SEP)
+    }
 
 
 def human_window(secs: int) -> str:
@@ -236,11 +354,12 @@ def evaluate() -> None:
 
     rules = q("""
         SELECT id, name, kind, coalesce(threshold,0), coalesce(window_secs,300),
-               coalesce(silenced_until < now(), true)
+               coalesce(silenced_until < now(), true),
+               coalesce(target->>'service', '*')
         FROM alert_rules WHERE enabled
     """)
 
-    for rid, name, kind, threshold, window, not_silenced in rules:
+    for rid, name, kind, threshold, window, not_silenced, scope in rules:
         fn = CONDITIONS.get(kind)
         if fn is None:
             continue
@@ -251,6 +370,7 @@ def evaluate() -> None:
             continue
 
         firing = {r[0]: r[1] for r in rows if r and r[0]}
+        firing = scoped(kind, scope, firing)
 
         prev = {
             r[0]: r[1]
@@ -306,7 +426,12 @@ def coverage() -> None:
     selected = set(conf.get("logServices") or [])
     services = {r[0] for r in q("SELECT DISTINCT service FROM metrics "
                                 "WHERE ts > now() - interval '1 hour'") if r and r[0]}
-    log_kinds = {"error_rate", "latency_p95"}
+    # Anything read out of log_rollup or endpoint_rollup only covers a service
+    # whose logs are actually being collected. Leaving the new kinds out here
+    # would show a service with logging disabled as covered by a rule that
+    # cannot see it.
+    log_kinds = {"error_rate", "latency_p95", "endpoint_latency",
+                 "endpoint_errors", "traffic_drop"}
     kinds = [r[0] for r in q("SELECT kind FROM alert_rules WHERE enabled") if r]
 
     rows = [
