@@ -354,6 +354,43 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
             ORDER BY ts DESC LIMIT 2;" 2>/dev/null || true
   fi
 
+  # ── per-service breakdown ──────────────────────────────────────────────────
+  #
+  # "Only one service shows a p95" is the first question anyone asks of this
+  # screen, and a single machine-wide verdict cannot answer it — the reason is
+  # different for each service. So say it per service, once, from the data.
+  #
+  # Fed through `pgq -f -` rather than `pgq -c "…"`: this SQL contains regexes
+  # and quotes, and wrapping it in a double-quoted shell string is exactly how
+  # the earlier `[^\s"'…]` character class ended up in the config literally.
+  info "latency by service (last hour)"
+  pgq -f - <<'SQL' 2>/dev/null || true
+SELECT '                 ' || rpad(service, 30) ||
+       lpad(lines::text, 6) || ' lines   ' ||
+       CASE
+         WHEN ended  > 0 THEN 'p95 from ' || ended || ' request pairs'
+         WHEN timed  > 0 THEN 'p95 from ' || timed || ' timed lines'
+         -- Ids present but the wording never matched. This is the one case
+         -- that is OUR gap rather than the application's, so it must not be
+         -- reported as "this service logs nothing".
+         WHEN withid > 0 THEN 'has request ids, but no line says "incoming request" / "request completed"'
+         ELSE 'no duration and no request id in any line'
+       END
+FROM (
+  SELECT service,
+         count(*) AS lines,
+         count(*) FILTER (WHERE attrs ? 'duration_ms')  AS timed,
+         count(*) FILTER (WHERE attrs->>'phase' = 'end') AS ended,
+         count(*) FILTER (WHERE body ~* '(request_?id|req_?id|correlation_?id|trace_?id|x-request-id)') AS withid
+  FROM log_entries
+  WHERE ts > now() - interval '1 hour'
+  GROUP BY service
+) s
+ORDER BY lines DESC;
+SQL
+  info "any configured service missing from that list stored no line at all in"
+  info "the last hour — nothing can be derived from a service that is silent."
+
   # ── endpoints ──────────────────────────────────────────────────────────────
   #
   # The app's key-operations table reads endpoint_rollup. Reported separately
