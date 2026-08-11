@@ -41,9 +41,19 @@ wanted() {
   return 1
 }
 
-# PM2 writes <name>-out.log and <name>-error.log, plus -<pm_id> in cluster mode.
-svc_of_file() {
-  basename "$1" | sed -E 's/-(out|error)(-[0-9]+)?\.log$//'
+# Shared with the metric collector — see common.sh. Not redefined here: the two
+# must agree on what a service is called, or the same process appears twice in
+# the app under names that differ by a rotation stamp.
+svc_of_file() { svc_of_pm2_file "$1"; }
+
+# PM2 processes that exist right now. Empty when pm2 is absent or reports
+# nothing, in which case the file list is used unfiltered — a tail that shows
+# too much is recoverable, one that shows nothing is not.
+LIVE_PM2=$(pm2_live_names | sort -u)
+
+is_live_pm2() {
+  [ -z "$LIVE_PM2" ] && return 0
+  printf '%s\n' "$LIVE_PM2" | grep -qxF "$1"
 }
 
 PIDS=()
@@ -88,7 +98,17 @@ shopt -s nullglob
 for dir in /root/.pm2/logs /home/*/.pm2/logs; do
   [ -d "$dir" ] || continue
   for f in "$dir"/*.log; do
-    wanted "$(svc_of_file "$f")" || continue
+    # pm2-logrotate archives. Nothing will ever append to them, so tailing one
+    # holds a watch forever for no output — and with 65 files on this machine
+    # the archives were the majority of them.
+    is_rotated_log "$f" && continue
+
+    svc=$(svc_of_file "$f")
+    # Only processes PM2 currently has. A deleted or renamed app leaves its logs
+    # behind indefinitely, so the file list drifts further from reality the
+    # longer a machine lives.
+    is_live_pm2 "$svc" || continue
+    wanted "$svc" || continue
     FILES+=("$f")
   done
 done
@@ -101,9 +121,12 @@ if [ ${#FILES[@]} -gt 0 ]; then
   # stderr is kept and tagged rather than discarded. Hiding it is what made the
   # inotify exhaustion above invisible.
   tail -F -n 0 "${FILES[@]}" 2>&1 | awk '
+    # Mirrors svc_of_pm2_file in common.sh — the rotation stamp has to come off
+    # before the stream suffix, or an archive reads as its own service.
     function svcname(p,  b) {
       b = p
       sub(/^.*\//, "", b)
+      sub(/__[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/, "", b)
       sub(/-(out|error)(-[0-9]+)?\.log$/, "", b)
       return b
     }

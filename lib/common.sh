@@ -46,6 +46,65 @@ load_env() {
   set +a
 }
 
+# systemd gives a service a minimal PATH — /usr/local/sbin:/usr/local/bin:
+# /usr/sbin:/usr/bin:/sbin:/bin — and nothing else. A pm2 installed through nvm
+# or a versioned node lives outside all of it, so `command -v pm2` finds nothing
+# under a timer while working perfectly over SSH. Look where node version
+# managers actually put things before giving up.
+find_pm2() {
+  local p
+  p=$(command -v pm2 2>/dev/null) && { echo "$p"; return 0; }
+  for p in /usr/local/bin/pm2 /usr/bin/pm2 \
+           /root/.nvm/versions/node/*/bin/pm2 \
+           /root/.volta/bin/pm2 \
+           /usr/local/n/versions/node/*/bin/pm2 \
+           /home/*/.nvm/versions/node/*/bin/pm2; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# Names of the PM2 processes that exist right now, one per line.
+#
+# PM2_HOME must be explicit for the same reason as the PATH search above, and
+# every home is tried because PM2 under a non-root user is normal on shared
+# machines.
+pm2_live_names() {
+  local bin home
+  bin=$(find_pm2) || return 0
+  for home in /root/.pm2 /home/*/.pm2; do
+    [ -d "$home" ] || continue
+    PM2_HOME="$home" "$bin" jlist 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for p in json.load(sys.stdin):
+        name = p.get("name")
+        if name:
+            print(name)
+except Exception:
+    pass
+' 2>/dev/null || true
+  done
+}
+
+# Service name for a PM2 log file.
+#
+# Strips the pm2-logrotate stamp before the stream suffix: a rotated file is
+# named <service>-error__2026-08-11_00-00-00.log, so removing only the suffix
+# leaves the date attached and every archive looks like its own service.
+svc_of_pm2_file() {
+  basename "$1" | sed -E 's/__[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}//; s/-(out|error)(-[0-9]+)?\.log$//'
+}
+
+# True for a pm2-logrotate archive: a file nothing will ever append to again.
+is_rotated_log() {
+  case "$(basename "$1")" in
+    *__[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*) return 0 ;;
+    *.gz|*.zip) return 0 ;;
+  esac
+  return 1
+}
+
 free_bytes() { df -B1 --output=avail / | tail -1 | tr -d ' '; }
 gb()         { echo $(( ${1:-0} / 1024 / 1024 / 1024 )); }
 

@@ -10,24 +10,6 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
-# systemd gives a service a minimal PATH — /usr/local/sbin:/usr/local/bin:
-# /usr/sbin:/usr/bin:/sbin:/bin — and nothing else. A pm2 installed through nvm
-# or a versioned node lives outside all of it, so `command -v pm2` found nothing
-# and the collector skipped PM2 entirely without a word. Look where node
-# managers actually put things before giving up.
-find_pm2() {
-  local p
-  p=$(command -v pm2 2>/dev/null) && { echo "$p"; return 0; }
-  for p in /usr/local/bin/pm2 /usr/bin/pm2 \
-           /root/.nvm/versions/node/*/bin/pm2 \
-           /root/.volta/bin/pm2 \
-           /usr/local/n/versions/node/*/bin/pm2 \
-           /home/*/.nvm/versions/node/*/bin/pm2; do
-    [ -x "$p" ] && { echo "$p"; return 0; }
-  done
-  return 1
-}
-
 collect_host() {
   local total used dtotal dused load1
   read -r total used <<<"$(free -b | awk '/^Mem:/{print $2, $3}')"
