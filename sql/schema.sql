@@ -277,3 +277,29 @@ CREATE INDEX IF NOT EXISTS endpoint_rollup_bucket ON endpoint_rollup (bucket DES
 CREATE INDEX IF NOT EXISTS endpoint_rollup_svc    ON endpoint_rollup (service, bucket DESC);
 
 INSERT INTO schema_version (version) VALUES (4) ON CONFLICT DO NOTHING;
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- schema v5 — request rate, error rate and Apdex
+--
+-- log_rollup.total counts LOG LINES, which is not the request rate: a service
+-- that logs four lines per request would report four times the traffic it
+-- serves. `timed` counts requests — exactly the rows that produced a duration,
+-- one per completed request — and is the correct denominator for both the rate
+-- and the error rate.
+--
+-- req_errors is failures among REQUESTS, not error lines. One failing request
+-- often logs a message, a stack trace and a summary; dividing that by requests
+-- yields error rates above 100%, which is how an error-rate panel loses the
+-- reader's trust permanently.
+--
+-- Apdex is stored as its two counts rather than as a score, because scores do
+-- not average: combining five-minute buckets into an hour has to re-divide the
+-- sums. T is 500 ms, the usual default for a web API, and 4T = 2 s. Baking T in
+-- means changing it does not retroactively change history — the alternative is
+-- keeping every raw duration, which is the thing these rollups exist to avoid.
+ALTER TABLE log_rollup ADD COLUMN IF NOT EXISTS timed      int DEFAULT 0;
+ALTER TABLE log_rollup ADD COLUMN IF NOT EXISTS req_errors int DEFAULT 0;
+ALTER TABLE log_rollup ADD COLUMN IF NOT EXISTS apdex_s    int DEFAULT 0;
+ALTER TABLE log_rollup ADD COLUMN IF NOT EXISTS apdex_t    int DEFAULT 0;
+
+INSERT INTO schema_version (version) VALUES (5) ON CONFLICT DO NOTHING;

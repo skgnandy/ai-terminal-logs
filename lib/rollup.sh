@@ -87,7 +87,8 @@ WITH resolved AS (
 ),
 service_level AS (
   INSERT INTO log_rollup (bucket, host, service, errors, warns, total,
-                          p50_ms, p95_ms, p99_ms, max_ms)
+                          p50_ms, p95_ms, p99_ms, max_ms,
+                          timed, req_errors, apdex_s, apdex_t)
   SELECT
     date_bin('5 minutes', ts, timestamptz '2000-01-01') AS bucket,
     host,
@@ -98,17 +99,31 @@ service_level AS (
     percentile_cont(0.50) WITHIN GROUP (ORDER BY dur),
     percentile_cont(0.95) WITHIN GROUP (ORDER BY dur),
     percentile_cont(0.99) WITHIN GROUP (ORDER BY dur),
-    max(dur)
+    max(dur),
+    -- One row per completed request: a duration only lands on the line that
+    -- finishes one. This is the request count, and `total` above is not — that
+    -- counts log lines, four of which may belong to a single request.
+    count(*) FILTER (WHERE dur IS NOT NULL),
+    count(*) FILTER (WHERE dur IS NOT NULL
+                       AND (status >= 500 OR severity IN ('ERROR','FATAL'))),
+    -- Apdex, as counts rather than a score: scores cannot be averaged when
+    -- these buckets are later combined into an hour. T = 500 ms, 4T = 2 s.
+    count(*) FILTER (WHERE dur IS NOT NULL AND dur <= 500),
+    count(*) FILTER (WHERE dur IS NOT NULL AND dur > 500 AND dur <= 2000)
   FROM resolved
   GROUP BY 1, 2, 3
   ON CONFLICT (bucket, host, service) DO UPDATE SET
-    errors = EXCLUDED.errors,
-    warns  = EXCLUDED.warns,
-    total  = EXCLUDED.total,
-    p50_ms = EXCLUDED.p50_ms,
-    p95_ms = EXCLUDED.p95_ms,
-    p99_ms = EXCLUDED.p99_ms,
-    max_ms = EXCLUDED.max_ms
+    errors     = EXCLUDED.errors,
+    warns      = EXCLUDED.warns,
+    total      = EXCLUDED.total,
+    p50_ms     = EXCLUDED.p50_ms,
+    p95_ms     = EXCLUDED.p95_ms,
+    p99_ms     = EXCLUDED.p99_ms,
+    max_ms     = EXCLUDED.max_ms,
+    timed      = EXCLUDED.timed,
+    req_errors = EXCLUDED.req_errors,
+    apdex_s    = EXCLUDED.apdex_s,
+    apdex_t    = EXCLUDED.apdex_t
   RETURNING 1
 )
 INSERT INTO endpoint_rollup (bucket, host, service, method, route,
