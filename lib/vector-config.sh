@@ -259,13 +259,64 @@ source = '''
     if http != null {
       code = to_int(http.code) ?? 0
       sev = if code >= 500 { "ERROR" } else if code >= 400 { "WARN" } else { "INFO" }
-      .attrs = { "status": code, "duration_ms": to_int(http.ms) ?? 0 }
     }
   }
   # Explicit branch, not `sev ?? "INFO"` — see the note above: `??` handles
   # errors, and a plain variable cannot error, so VRL rejects that form.
   if sev == null { sev = "INFO" }
   .severity = sev
+
+  # ── request timing ───────────────────────────────────────────────────────
+  # Every percentile in the app comes from this one field. It is extracted
+  # OUTSIDE the severity branch above, which is where it used to live: a line
+  # that already said "INFO" never reached the extractor, so any framework that
+  # logs a level and a duration on the same line — which is most of them,
+  # certainly Pino and Bunyan — produced no latency data at all while looking
+  # perfectly healthy.
+  #
+  # Three shapes, most specific first. Deliberately not "any number followed by
+  # ms anywhere in the line": a retry backoff or a cache TTL would be recorded
+  # as request latency, and a p95 built from those is worse than a blank chart
+  # because it looks like an answer.
+  ms = null
+
+  # Pino, Bunyan, structured logs, key=value: responseTime: 42, duration_ms=12,
+  # "elapsed":"1.5s", took=900ms.
+  kv = parse_regex(raw, r'(?i)\b(?:response_?time(?:_?ms)?|duration_?(?:ms)?|elapsed(?:_?ms)?|latency(?:_?ms)?|took|rt)\b"?\s*[=:]\s*"?(?P<n>\d+(?:\.\d+)?)\s*(?P<unit>ms|s\b)?') ?? null
+  if kv != null {
+    n = to_float(kv.n) ?? 0.0
+    # A bare number under one of these keys is milliseconds by convention.
+    if kv.unit == "s" { n = n * 1000.0 }
+    ms = n
+  }
+
+  # The shape the previous parser handled: `... (123 ms) 200`.
+  if ms == null {
+    paren = parse_regex(raw, r'\((?P<n>\d+(?:\.\d+)?) ?ms\)') ?? null
+    if paren != null { ms = to_float(paren.n) ?? 0.0 }
+  }
+
+  # Morgan's default format ends `- 12.345 ms`, and nginx logs configured with
+  # $request_time follow the same tail.
+  if ms == null {
+    morgan = parse_regex(raw, r'-\s+(?P<n>\d+(?:\.\d+)?)\s*ms\s*$') ?? null
+    if morgan != null { ms = to_float(morgan.n) ?? 0.0 }
+  }
+
+  status = null
+  st = parse_regex(raw, r'(?i)\b(?:status(?:_?code)?|statuscode)\b"?\s*[=:]\s*"?(?P<c>\d{3})\b') ?? null
+  if st != null { status = to_int(st.c) ?? null }
+  if status == null && http != null { status = to_int(http.code) ?? null }
+
+  # Built as one object rather than assigned twice: a second `.attrs = {...}`
+  # replaces the first, so writing status and duration separately would silently
+  # drop whichever came first.
+  if ms != null || status != null {
+    attrs = {}
+    if ms != null     { attrs = set!(attrs, ["duration_ms"], ms) }
+    if status != null { attrs = set!(attrs, ["status"], status) }
+    .attrs = attrs
+  }
 
   # ── redaction ────────────────────────────────────────────────────────────
   # Applied BEFORE the write. This store is queried from a phone and kept for

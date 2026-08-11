@@ -230,6 +230,39 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
 
   info "host samples   $(pgq -c "SELECT count(*) FROM host_metrics WHERE ts > now() - interval '10 minutes';" 2>/dev/null || echo 0) in 10 min"
 
+  # ── latency ────────────────────────────────────────────────────────────────
+  # Every percentile in the app comes from attrs.duration_ms, and there is no
+  # other way to tell whether it is being extracted: a blank p95 chart looks
+  # identical whether the parser is broken, the service is idle, or the
+  # application simply never logs a response time. Only the last of those is
+  # fixed in the application rather than here, so guessing wrong costs a day.
+  L_TOTAL=$(pgq -c "SELECT count(*) FROM log_entries WHERE ts > now() - interval '1 hour';" 2>/dev/null || echo 0)
+  L_TIMED=$(pgq -c "SELECT count(*) FROM log_entries WHERE ts > now() - interval '1 hour' AND attrs ? 'duration_ms';" 2>/dev/null || echo 0)
+
+  if [ "${L_TIMED:-0}" -gt 0 ]; then
+    ok "latency        ${L_TIMED} of ${L_TOTAL} lines in the last hour carry a duration"
+    pgq -c "SELECT '                 ' || service || '  p50 ' ||
+                   round(percentile_cont(0.50) WITHIN GROUP (ORDER BY d)::numeric, 1) || 'ms  p95 ' ||
+                   round(percentile_cont(0.95) WITHIN GROUP (ORDER BY d)::numeric, 1) || 'ms  (' || count(*) || ' timed)'
+            FROM (SELECT service, (attrs->>'duration_ms')::double precision AS d
+                  FROM log_entries
+                  WHERE ts > now() - interval '1 hour'
+                    AND attrs->>'duration_ms' ~ '^[0-9]+(\.[0-9]+)?\$') s
+            GROUP BY service ORDER BY 1;" 2>/dev/null || true
+  else
+    bad "latency        no line in the last hour carries a duration — p50/p95/p99 will be blank"
+    # The decisive evidence: what a request line on THIS machine actually looks
+    # like. If it has no timing field, no parser change can produce a percentile
+    # and the fix belongs in the application's logger.
+    info "sample request lines, so the shape can be read rather than guessed:"
+    pgq -c "SELECT '          ' || left(regexp_replace(body, E'[\n\r]+', ' | ', 'g'), 180)
+            FROM log_entries
+            WHERE ts > now() - interval '6 hours'
+              AND (body ILIKE '%request completed%' OR body ILIKE '%statusCode%'
+                   OR body ILIKE '%HTTP/1.%' OR body ILIKE '% ms%')
+            ORDER BY ts DESC LIMIT 5;" 2>/dev/null || true
+  fi
+
   # A partitioned table with no partition covering today rejects every insert.
   # host_metrics and metrics are both partitioned, so one having rows and the
   # other not is exactly what a missing partition looks like.
