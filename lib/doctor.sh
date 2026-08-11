@@ -253,23 +253,30 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
     bad "latency        no line in the last hour carries a duration — p50/p95/p99 will be blank"
 
     # Which of the two causes is it: the parser missing a field that IS there,
-    # or an application that never logs one? Scan for any key that looks like a
-    # timing rather than eyeballing samples — the first version of this check
-    # printed 180 characters of each line, which on a multi-field record cut off
-    # before the end and so could not answer the question it was asked.
+    # or an application that never logs one?
+    #
+    # The value has to be a bare number, not just the key looking time-ish. The
+    # first version matched any key containing "time" or "response" and duly
+    # reported created_time, scheduleDateTime and turnaround_time — ordinary
+    # business fields holding date strings — under a heading telling the reader
+    # the parser had missed a timing. That is worse than reporting nothing: it
+    # sends someone to change a parser that was right.
+    #
+    # A duration is a number. A timestamp is a date string. That is the whole
+    # discriminator, and it is reliable.
     info "timing-like fields present in the last hour:"
-    FOUND=$(pgq -c "SELECT DISTINCT '          ' || m[1]
+    FOUND=$(pgq -c "SELECT DISTINCT '          ' || m[1] || ': ' || m[2]
             FROM log_entries,
                  LATERAL regexp_matches(body,
-                   '([A-Za-z_.]*(?:[Tt]ime|[Dd]uration|[Ee]lapsed|[Ll]atency|[Rr]esponse)[A-Za-z_.]*)\"?\s*[=:]', 'g') AS m
+                   '([A-Za-z_.]*(?:[Dd]uration|[Ee]lapsed|[Ll]atency|[Rr]esponse[Tt]ime|[Tt]ook|_ms|[Mm]illis)[A-Za-z_.]*)\"?\s*[=:]\s*\"?([0-9]+(?:\.[0-9]+)?)', 'g') AS m
             WHERE ts > now() - interval '1 hour'
             LIMIT 20;" 2>/dev/null || true)
     if [ -n "$FOUND" ]; then
       printf '%s\n' "$FOUND"
-      info "^ a field above holds the timing but the parser did not read it."
-      info "  Report these names — the extractor needs to learn them."
+      info "^ one of these holds the request duration but the extractor did not"
+      info "  read it. Report the names — the parser needs to learn them."
     else
-      info "          (none — no field in any log line looks like a timing)"
+      info "          (none — no field anywhere holds a numeric duration)"
       info "the application never records how long a request took, so no parser"
       info "change can produce a percentile. Add one field where the request is"
       info "logged, for example responseTime: Date.now() - start"
