@@ -265,12 +265,24 @@ cmd_alerts() {
                 WHERE s.state = 'firing' ORDER BY s.since DESC) s;"
       ;;
     set)      python3 "$LIB_DIR/alert-rule.py" "${2:?rule id required}" "${3:?json patch required}" ;;
+    # add/delete go through the same allowlisted builder as `set`, which is the
+    # only place permitted to turn user input into SQL against this table.
+    add)      python3 "$LIB_DIR/alert-rule.py" --create "${2:?json rule required}" ;;
+    delete)   python3 "$LIB_DIR/alert-rule.py" --delete "${2:?rule id required}" ;;
+    kinds)
+      # What the evaluator can actually run, straight from its dispatch table.
+      # The app builds its rule-type picker from this instead of hard-coding a
+      # list that could drift into offering a kind nothing evaluates.
+      python3 -c "import sys; sys.path.insert(0, '$LIB_DIR');
+import json; from alerts import CONDITIONS, MESSAGES
+print(json.dumps([{'kind': k, 'describes': MESSAGES.get(k, '')} for k in sorted(CONDITIONS)]))"
+      ;;
     silence)  pgq -c "UPDATE alert_rules SET silenced_until = now() + interval '${3:-60} minutes'
                       WHERE id = ${2:?rule id required};" >/dev/null && echo '{"ok":true}' ;;
     unsilence) pgq -c "UPDATE alert_rules SET silenced_until = NULL
                        WHERE id = ${2:?rule id required};" >/dev/null && echo '{"ok":true}' ;;
     run)      python3 "$LIB_DIR/alerts.py" ;;
-    *) die "usage: logagent alerts {list|firing|coverage|events [n]|set <id> '<patch>'|silence <id> [min]|unsilence <id>|run}" ;;
+    *) die "usage: logagent alerts {list|firing|coverage|kinds|events [n]|add '<json>'|set <id> '<patch>'|delete <id>|silence <id> [min]|unsilence <id>|run}" ;;
   esac
 }
 
@@ -376,7 +388,8 @@ usage: logagent <command>
   status                        JSON: config, discovered services, health, stats
   set --json '<patch>' [--purge]  merge config; retention changes apply immediately
   channels --json '<patch>'     configure fcm / telegram / smtp
-  alerts <sub>                  list | firing | coverage | events | set | silence | run
+  alerts <sub>                  list | firing | coverage | kinds | events
+                                add | set | delete | silence | unsilence | run
   errors <sub>                  list [all] | state <fp> <open|ignored|resolved>
   probe                         run database and certificate probes now
   rollup                        recompute rollups and error groups now
