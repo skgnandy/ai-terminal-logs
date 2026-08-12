@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Emergency disk guard.
+# The two ways collection dies quietly, checked every five minutes: a collector
+# stuck past the end of a rotated file, and a disk about to fill.
 #
 # Time-based retention cannot stop a sudden log flood: a single misbehaving
 # service can fill the remaining disk long before the daily timer runs. This is
@@ -41,8 +42,86 @@ drop_oldest() {
   echo "$t"
 }
 
+# ── collector position guard ────────────────────────────────────────────────
+#
+# pm2-logrotate rotates without changing the inode, so the position the
+# collector saved for the pre-rotation file survives into the new, smaller one.
+# It then stores nothing until that file grows past the old length — for a log
+# that rotates daily, never.
+#
+# Nothing reports this. The unit is active, the config validates, the file is
+# being written, the database is healthy, and no error is logged; the only
+# symptom is a service that silently stops appearing. It cost a full day of one
+# machine's logs before it was found by hand, which is exactly the class of
+# failure this timer exists to catch.
+#
+# Prints the offending file and returns 0 when one is found.
+stalled_position() {
+  python3 - "$STATE/vector" <<'PY'
+import glob, json, os, sys, time
+
+state = sys.argv[1]
+
+doc = None
+for root, _dirs, names in os.walk(state):
+    if "checkpoints.json" in names:
+        try:
+            doc = json.load(open(os.path.join(root, "checkpoints.json")))
+        except Exception:                          # noqa: BLE001
+            doc = None
+        break
+
+if not doc:
+    raise SystemExit(1)
+
+pos = {}
+for entry in doc.get("checkpoints", []):
+    pair = (entry.get("fingerprint") or {}).get("device_and_inode")
+    if pair and len(pair) == 2:
+        pos[(pair[0], pair[1])] = entry.get("position") or 0
+
+now = time.time()
+for directory in ["/root/.pm2/logs"] + glob.glob("/home/*/.pm2/logs"):
+    for path in glob.glob(os.path.join(directory, "*.log")):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        saved = pos.get((st.st_dev, st.st_ino))
+        # Only a file being written right now. One sitting idle below its
+        # recorded position loses nothing, and restarting the collector over it
+        # would throw away every other file's position for no gain.
+        if saved is None or now - st.st_mtime > 600:
+            continue
+        if saved > st.st_size:
+            print(f"{path} (reading at {saved}, file is {st.st_size})")
+            raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+# Clearing the positions is safe to do unattended: it can only skip forward to
+# the end of each file, never replay. And it cannot loop — the condition is the
+# saved position itself, which this removes.
+recover_position() {
+  local stalled="$1"
+  systemctl stop vector >/dev/null 2>&1 || true
+  find "$STATE/vector" -name 'checkpoints.json*' -type f -delete 2>/dev/null || true
+  systemctl start vector >/dev/null 2>&1 || true
+
+  audit rewind "collector stalled past end of file: $stalled"
+  log "collector was stalled on $stalled — positions cleared, vector restarted"
+  notify "${HOST_NAME:-host}: log collection had stalled after a rotation and was restarted. $stalled"
+}
+
 main() {
   docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER" || exit 0
+
+  local stalled
+  if stalled=$(stalled_position); then
+    recover_position "$stalled"
+  fi
 
   local free dropped
   free=$(pct_free)

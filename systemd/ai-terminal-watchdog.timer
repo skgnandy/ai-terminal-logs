@@ -1,5 +1,5 @@
 [Unit]
-Description=ai-terminal disk watchdog (every 5 minutes)
+Description=ai-terminal watchdog (every 5 minutes)
 Documentation=https://github.com/skgnandy/ai-terminal-logs
 
 [Timer]

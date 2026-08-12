@@ -1,5 +1,5 @@
 [Unit]
-Description=ai-terminal disk watchdog (emergency retention shrink)
+Description=ai-terminal watchdog (stalled collector, emergency retention shrink)
 Documentation=https://github.com/skgnandy/ai-terminal-logs
 After=docker.service
 Requires=docker.service
