@@ -511,6 +511,13 @@ PY
       # last hour. Saying so removes the only other suspect.
       if [ "${rows:-0}" -eq 0 ] && [ "$age" -gt 3600 ]; then
         detail="$detail — service is silent"
+      elif [ "${rows:-0}" -eq 0 ] && [ "$age" -lt 600 ] && [ "${UP_SECS:-99999}" -lt 180 ]; then
+        # The row count covers the last hour; the collector has been up for
+        # seconds. Almost all of that hour belongs to the previous, possibly
+        # broken, configuration. Calling that a fault sends the reader chasing a
+        # bug that a fresh restart has not had time to disprove — which is what
+        # the run right after an update looked like.
+        detail="$detail — collector restarted ${UP_SECS}s ago, too early to judge"
       elif [ "${rows:-0}" -eq 0 ] && [ "$age" -lt 600 ]; then
         # The one combination that is unambiguously a collector fault: the file
         # is being written right now and not one line of it was stored. Every
@@ -536,9 +543,15 @@ PY
   # selected list is read correctly, filtered out, and reported by every other
   # check as a healthy collector with a silent service.
   info "pm2 files being written, and the service each resolves to"
-  find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f -name '*.log' \
-       -mmin -10 -printf '%p\n' 2>/dev/null |
-    python3 - "$SERVICES_LIST" <<'PY'
+
+  # Collected into a variable and passed as an argument, NOT piped. `python3 -`
+  # reads the program from stdin, and a heredoc on the same command replaces
+  # stdin with the program — so anything piped in is discarded and the block
+  # reports "nothing" while a file is being written under its nose. That is
+  # exactly what the first release of this check did.
+  LIVE_FILES=$(find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f \
+                 -name '*.log' -mmin -10 -printf '%p\n' 2>/dev/null || true)
+  python3 - "$SERVICES_LIST" "$LIVE_FILES" <<'PY'
 import os, re, sys
 
 # Identical to the parser's regex in lib/vector-config.sh. The trailing group is
@@ -546,7 +559,7 @@ import os, re, sys
 NAME = re.compile(r'-(out|error)(-\d+)?(__[^/]*)?\.log$')
 
 selected = {s.strip() for s in sys.argv[1].splitlines() if s.strip()}
-files = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
+files = [ln.strip() for ln in sys.argv[2].splitlines() if ln.strip()]
 
 if not files:
     print("                 no pm2 log file has been written in the last 10 minutes")
@@ -585,7 +598,11 @@ PY
   #   change nothing.
   if [ -n "$STUCK_FILES" ]; then
     bad "a log file is being written but nothing from it is being stored"
-    printf '%s' "$STUCK_FILES" | python3 - "$STATE/vector" <<'PY'
+    # Argument, not a pipe — see the note above the file-name map. Piped in, the
+    # heredoc ate it and this printed the FAIL headline with nothing under it,
+    # which is worse than not running: it looks like the check found nothing to
+    # say about the file it just flagged.
+    python3 - "$STATE/vector" "$STUCK_FILES" <<'PY'
 import json, os, re, sys
 
 state = sys.argv[1]
@@ -619,7 +636,7 @@ for entry in (doc or {}).get("checkpoints", []):
     if pair and len(pair) == 2:
         by_inode[(pair[0], pair[1])] = entry.get("position")
 
-for line in sys.stdin.read().splitlines():
+for line in sys.argv[2].splitlines():
     if "\t" not in line:
         continue
     svc, file_path = line.split("\t", 1)
