@@ -23,10 +23,35 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
-# Recompute the last 15 minutes rather than only the newest bucket: late-arriving
-# events (Vector disk buffer replay after a restart) would otherwise be lost from
-# a bucket that had already been written.
-pgx <<'SQL' >/dev/null
+# Normally recomputes the last 15 minutes rather than only the newest bucket:
+# late-arriving events (Vector disk buffer replay after a restart) would
+# otherwise be lost from a bucket that had already been written.
+#
+#   rollup.sh                 the last 15 minutes
+#   rollup.sh --backfill 3    the last 3 days, in 6-hour chunks
+#
+# Backfill exists because these rollups are only ever written forwards. Every
+# time the parser learns something new — request pairing, then route and status,
+# then the request counts behind Apdex — the columns it feeds stay NULL for
+# every bucket already written, so the charts start abruptly on the day of the
+# upgrade and the history before it reads as an outage. Backfill recomputes
+# those buckets from log_entries, which still holds them within retention.
+#
+# Chunked rather than one statement over three days: the pairing join is a
+# lateral over the same table, and handing it every partition at once is how a
+# maintenance job takes a small VPS down.
+BACKFILL_DAYS=0
+if [ "${1:-}" = "--backfill" ]; then
+  BACKFILL_DAYS=${2:-3}
+  case "$BACKFILL_DAYS" in
+    ''|*[!0-9]*) die "--backfill takes a whole number of days" ;;
+  esac
+fi
+
+# One pass over a window. Both tables are filled from a single derivation, so
+# the per-service and per-endpoint numbers cannot disagree.
+rollup_range() {
+  pgx -v from_ts="$1" -v to_ts="$2" <<'SQL' >/dev/null
 -- date_bin, not date_trunc + arithmetic: `numeric * interval` has no operator in
 -- Postgres, so the obvious floor(minute/5) * interval '5 minutes' form fails.
 --
@@ -83,7 +108,8 @@ WITH resolved AS (
     ORDER BY s.ts DESC
     LIMIT 1
   ) paired ON true
-  WHERE e.ts > now() - interval '15 minutes'
+  WHERE e.ts >= :'from_ts'::timestamptz
+    AND e.ts <  :'to_ts'::timestamptz
 ),
 service_level AS (
   INSERT INTO log_rollup (bucket, host, service, errors, warns, total,
@@ -160,6 +186,24 @@ ON CONFLICT (bucket, host, service, method, route) DO UPDATE SET
   p99_ms    = EXCLUDED.p99_ms,
   max_ms    = EXCLUDED.max_ms;
 SQL
+}
+
+if [ "$BACKFILL_DAYS" -gt 0 ]; then
+  # Oldest chunk first, so a run interrupted half way has filled the gap
+  # nearest the start of the window rather than a stripe in the middle.
+  total_hours=$(( BACKFILL_DAYS * 24 ))
+  h=$total_hours
+  while [ "$h" -gt 0 ]; do
+    next=$(( h - 6 )); [ "$next" -lt 0 ] && next=0
+    from=$(date -u -d "-${h} hours" '+%Y-%m-%d %H:%M:%S+00')
+    to=$(date -u -d "-${next} hours" '+%Y-%m-%d %H:%M:%S+00')
+    log "rollup ${from} .. ${to}"
+    rollup_range "$from" "$to"
+    h=$next
+  done
+else
+  rollup_range     "$(date -u -d '-15 minutes' '+%Y-%m-%d %H:%M:%S+00')"     "$(date -u -d '+1 minute'   '+%Y-%m-%d %H:%M:%S+00')"
+fi
 
 # Error grouping.
 #
@@ -169,6 +213,19 @@ SQL
 #
 # Only the first line of a multiline record is fingerprinted — a stack trace's
 # frames are noise for grouping, and the full body is kept as the sample.
+#
+# Skipped entirely during a backfill. Unlike the rollups above, which are
+# idempotent because ON CONFLICT overwrites the bucket, this ADDS to
+# occurrences — replaying three days of history would multiply every group's
+# count by however many times it was replayed.
+#
+# The window is the timer's own period, not the rollups' fifteen minutes. It
+# used to be fifteen, which meant every line was added on three consecutive
+# runs and every occurrence count was roughly three times the truth. The cost
+# of five is that a line arriving more than five minutes late is missed from
+# the count; an inflated count is worse, because it is wrong every time rather
+# than rarely.
+if [ "$BACKFILL_DAYS" -eq 0 ]; then
 pgx <<'SQL' >/dev/null
 WITH normalised AS (
   SELECT
@@ -187,7 +244,7 @@ WITH normalised AS (
     split_part(body, E'\n', 1) AS sample,
     ts
   FROM log_entries
-  WHERE ts > now() - interval '15 minutes'
+  WHERE ts > now() - interval '5 minutes'
     AND severity IN ('ERROR','FATAL')
 )
 INSERT INTO error_groups (fp, host, service, severity, sample,
@@ -203,6 +260,7 @@ ON CONFLICT (fp) DO UPDATE SET
   state       = CASE WHEN error_groups.state = 'resolved' THEN 'open'
                      ELSE error_groups.state END;
 SQL
+fi
 
 # Rollups are small (a few KB/day) so they outlive raw logs: retention can be 3
 # days while the service graphs still show 30.

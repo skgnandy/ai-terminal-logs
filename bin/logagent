@@ -373,7 +373,7 @@ case "${1:-status}" in
   doctor)    bash "$LIB_DIR/doctor.sh" ;;
   tail)      shift; exec bash "$LIB_DIR/tail.sh" "$@" ;;
   probe)     bash "$LIB_DIR/probes.sh" ;;
-  rollup)    bash "$LIB_DIR/rollup.sh" ;;
+  rollup)    shift; bash "$LIB_DIR/rollup.sh" "$@" ;;
   reload)    bash "$LIB_DIR/vector-config.sh" ;;
   maintain)  bash "$LIB_DIR/partitions.sh" ;;
   uninstall) shift; cmd_uninstall "${1:-}" ;;
@@ -392,7 +392,10 @@ usage: logagent <command>
                                 add | set | delete | silence | unsilence | run
   errors <sub>                  list [all] | state <fp> <open|ignored|resolved>
   probe                         run database and certificate probes now
-  rollup                        recompute rollups and error groups now
+  rollup [--backfill <days>]    recompute rollups and error groups now.
+                                --backfill also recomputes HISTORY, which is
+                                what fills charts that start abruptly on the
+                                day the agent last learned something new
   notify "<message>" ['<data>'] send a test alert through every channel
   pause | resume                stop or start collection (data retained)
   reload                        regenerate vector config
