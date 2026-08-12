@@ -545,26 +545,38 @@ PY
   if [ -n "$STUCK_FILES" ]; then
     bad "a log file is being written but nothing from it is being stored"
     printf '%s' "$STUCK_FILES" | python3 - "$STATE/vector" <<'PY'
-import json, os, sys
+import json, os, re, sys
 
 state = sys.argv[1]
-path = os.path.join(state, "checkpoints.json")
-try:
-    doc = json.load(open(path))
-except Exception as exc:                       # noqa: BLE001
-    print(f"          cannot read {path}: {exc}")
-    sys.exit(0)
+
+# The service name the collector derives from a filename, kept identical to the
+# parser's regex. Printing it here is the point: when a rotated file resolves to
+# a name that is not in the selected list, every line of it is filtered out and
+# this is the only place that becomes visible.
+NAME = re.compile(r'-(out|error)(-\d+)?(__[^/]*)?\.log$')
+
+# Vector has moved this file between releases and between component layouts, so
+# look for it rather than assuming one path. Reporting "cannot read <one path>"
+# told the reader nothing about the file they actually care about.
+path, doc = None, None
+for root, _dirs, files in os.walk(state):
+    if "checkpoints.json" in files:
+        candidate = os.path.join(root, "checkpoints.json")
+        try:
+            doc = json.load(open(candidate))
+            path = candidate
+            break
+        except Exception:                      # noqa: BLE001
+            continue
 
 # Keyed by whichever fingerprint strategy is in force. device_and_inode stores
 # the pair; a checksum stores a number. Index both so this reports either way.
-by_inode, positions = {}, []
-for entry in doc.get("checkpoints", []):
+by_inode = {}
+for entry in (doc or {}).get("checkpoints", []):
     fp = entry.get("fingerprint") or {}
-    pos = entry.get("position")
-    positions.append(pos)
     pair = fp.get("device_and_inode")
     if pair and len(pair) == 2:
-        by_inode[(pair[0], pair[1])] = pos
+        by_inode[(pair[0], pair[1])] = entry.get("position")
 
 for line in sys.stdin.read().splitlines():
     if "\t" not in line:
@@ -576,11 +588,30 @@ for line in sys.stdin.read().splitlines():
         print(f"          {svc}: cannot stat {file_path}: {exc}")
         continue
 
-    pos = by_inode.get((st.st_dev, st.st_ino))
     print(f"          {svc}")
     print(f"            file      {file_path}")
     print(f"            size      {st.st_size} bytes   inode {st.st_ino}")
-    if pos is None:
+
+    # Checked before the checkpoint, because it invalidates everything after it:
+    # if the name resolves to something other than the selected service, the
+    # lines are read correctly and thrown away by the filter, and the collector
+    # is not at fault at all.
+    derived = NAME.sub('', os.path.basename(file_path))
+    if derived != svc:
+        print(f"            SERVICE NAME MISMATCH")
+        print(f"            this file resolves to {derived!r}, not {svc!r},")
+        print("            so every line of it is dropped by the service filter.")
+        print("            A rotated log whose name the parser does not")
+        print("            recognise does this. Update the agent — the current")
+        print("            release strips pm2-logrotate's suffix — then:")
+        print("              logagent reload")
+        continue
+
+    pos = by_inode.get((st.st_dev, st.st_ino))
+    if path is None:
+        print("            checkpoint  no checkpoints.json found under")
+        print(f"            {state} — cannot tell where the collector is reading.")
+    elif pos is None:
         print("            checkpoint  NONE — the collector is not watching this")
         print("            file at all. Check that its directory is in the pm2")
         print("            include list and that it is readable.")

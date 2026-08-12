@@ -196,7 +196,17 @@ source = '''
       .service = replace(base, ".log", "")
       .kind = "nginx"
     } else {
-      .service = replace(base, r'-(out|error)(-\d+)?\.log$', "")
+      # The trailing `(__[^/]*)?` matches what pm2-logrotate appends when it
+      # rotates: AtriaForce-Backend-Prod-out-17__2026-08-11_23-14-00.log.
+      #
+      # Without it the rotated file's service name is the WHOLE filename, which
+      # is not in the selected list, so the filter downstream drops every line
+      # of it. That is exactly what happened here: pm2 rotated at 23:14, kept
+      # writing to the renamed file, and the service vanished from the database
+      # while its log kept growing — no error, no dropped-event count, every
+      # health check green. A rotation is the one moment a log pipeline must not
+      # be surprised by, and this one was.
+      .service = replace(base, r'-(out|error)(-\d+)?(__[^/]*)?\.log$', "")
       .kind = "pm2"
       .stream = if match(path, r'-error') { "stderr" } else { "stdout" }
     }
