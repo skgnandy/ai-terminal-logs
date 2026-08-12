@@ -529,6 +529,47 @@ PY
     printf '                 %-32s %6s rows   %s\n' "$svc" "${rows:-0}" "$detail"
   done
 
+  # Every pm2 file that is actually being written right now, and the service
+  # name the parser derives from it. Printed unconditionally, not only when a
+  # service already looks broken, because the failure this catches is invisible
+  # from the service side: a file whose derived name matches nothing in the
+  # selected list is read correctly, filtered out, and reported by every other
+  # check as a healthy collector with a silent service.
+  info "pm2 files being written, and the service each resolves to"
+  find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f -name '*.log' \
+       -mmin -10 -printf '%p\n' 2>/dev/null |
+    python3 - "$SERVICES_LIST" <<'PY'
+import os, re, sys
+
+# Identical to the parser's regex in lib/vector-config.sh. The trailing group is
+# pm2-logrotate's suffix; without it a rotated file resolves to its own filename.
+NAME = re.compile(r'-(out|error)(-\d+)?(__[^/]*)?\.log$')
+
+selected = {s.strip() for s in sys.argv[1].splitlines() if s.strip()}
+files = [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
+
+if not files:
+    print("                 no pm2 log file has been written in the last 10 minutes")
+    raise SystemExit
+
+bad = 0
+for path in sorted(files):
+    derived = NAME.sub('', os.path.basename(path))
+    mark = "collected" if derived in selected else "DROPPED — not a selected service"
+    if derived not in selected:
+        bad += 1
+    print(f"                 {os.path.basename(path):<52} -> {derived!r}  {mark}")
+
+if bad:
+    print()
+    print("                 A DROPPED line means the collector reads that file and the")
+    print("                 service filter throws every line away. Either the name is")
+    print("                 not in the selected list, or the parser does not recognise")
+    print("                 the filename — which is what a rotated log looks like on an")
+    print("                 agent older than 1.13.0. Update the agent, then:")
+    print("                   logagent reload")
+PY
+
   # A file being written that stores nothing is always the collector, and the
   # collector keeps its position in a checkpoint file. Comparing that position
   # to the file's current size separates the two ways this happens, which need
