@@ -518,6 +518,42 @@ PY
     printf '                 %-32s %6s rows   %s\n' "$svc" "${rows:-0}" "$detail"
   done
 
+  # ── rollup freshness ───────────────────────────────────────────────────────
+  #
+  # The charts read rollups; everything above reads raw rows. When those two
+  # disagree the screen shows a service that stopped hours ago while the
+  # database is plainly still being written, and nothing here said so — the
+  # timer reports "success" because a run that produces no rows still exits 0.
+  #
+  # Reported as a lag against the newest raw row rather than against now(), so
+  # a machine that is genuinely idle does not read as broken.
+  for t in log_rollup endpoint_rollup; do
+    [ "$(pgq -c "SELECT to_regclass('$t') IS NOT NULL;" </dev/null 2>/dev/null)" = "t" ] || continue
+    LAG=$(pgq -f - </dev/null 2>/dev/null <<SQL
+SELECT coalesce(
+         round(extract(epoch FROM (
+           (SELECT max(ts) FROM log_entries) - (SELECT max(bucket) FROM $t)
+         )) / 60)::text, 'never')
+SQL
+)
+    NEWEST=$(pgq -c "SELECT coalesce(max(bucket)::text, 'none') FROM $t;" </dev/null 2>/dev/null || echo '?')
+
+    if [ "$LAG" = "never" ] || [ -z "$LAG" ]; then
+      bad "$t has no rows at all — the charts it feeds will be blank"
+      info "run: logagent rollup --backfill ${DAYS:-3}"
+    elif [ "$LAG" -gt 20 ] 2>/dev/null; then
+      # Buckets are five minutes wide and the timer runs every five, so up to
+      # ten minutes behind is normal. Twenty is not.
+      bad "$t is ${LAG} min behind the newest log row (newest bucket $NEWEST)"
+      info "the charts stop there while logs keep arriving. Check:"
+      info "  systemctl status ai-terminal-rollup.service"
+      info "  journalctl -u ai-terminal-rollup.service -n 30 --no-pager"
+      info "then backfill the gap: logagent rollup --backfill ${DAYS:-3}"
+    else
+      ok "$t current (${LAG} min behind the newest log row)"
+    fi
+  done
+
   # ── endpoints ──────────────────────────────────────────────────────────────
   #
   # The app's key-operations table reads endpoint_rollup. Reported separately
