@@ -518,6 +518,10 @@ PY
         # bug that a fresh restart has not had time to disprove — which is what
         # the run right after an update looked like.
         detail="$detail — collector restarted ${UP_SECS}s ago, too early to judge"
+        # Still inspected below. Softening the verdict must not also switch off
+        # the inspection: the first release of this branch did both, so the one
+        # run that mattered printed a reassuring note and no checkpoint at all.
+        STUCK_FILES="${STUCK_FILES}${svc}"$'\t'"$(printf '%s' "$newest" | cut -d' ' -f3-)"$'\n'
       elif [ "${rows:-0}" -eq 0 ] && [ "$age" -lt 600 ]; then
         # The one combination that is unambiguously a collector fault: the file
         # is being written right now and not one line of it was stored. Every
@@ -542,7 +546,7 @@ PY
   # from the service side: a file whose derived name matches nothing in the
   # selected list is read correctly, filtered out, and reported by every other
   # check as a healthy collector with a silent service.
-  info "pm2 files being written, and the service each resolves to"
+  info "pm2 files being written: service, and where the collector is reading"
 
   # Collected into a variable and passed as an argument, NOT piped. `python3 -`
   # reads the program from stdin, and a heredoc on the same command replaces
@@ -551,8 +555,8 @@ PY
   # exactly what the first release of this check did.
   LIVE_FILES=$(find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f \
                  -name '*.log' -mmin -10 -printf '%p\n' 2>/dev/null || true)
-  python3 - "$SERVICES_LIST" "$LIVE_FILES" <<'PY'
-import os, re, sys
+  python3 - "$SERVICES_LIST" "$LIVE_FILES" "$STATE/vector" <<'PY'
+import json, os, re, sys
 
 # Identical to the parser's regex in lib/vector-config.sh. The trailing group is
 # pm2-logrotate's suffix; without it a rotated file resolves to its own filename.
@@ -560,27 +564,74 @@ NAME = re.compile(r'-(out|error)(-\d+)?(__[^/]*)?\.log$')
 
 selected = {s.strip() for s in sys.argv[1].splitlines() if s.strip()}
 files = [ln.strip() for ln in sys.argv[2].splitlines() if ln.strip()]
+state = sys.argv[3]
 
 if not files:
     print("                 no pm2 log file has been written in the last 10 minutes")
     raise SystemExit
 
-bad = 0
+# The read position belongs in this table, not in a separate check that only
+# runs once something already looks broken. A correct service name and a stalled
+# position look identical from every other angle — the file grows, the collector
+# is active, the config validates, and no line is ever stored.
+by_inode = {}
+for root, _dirs, names in os.walk(state):
+    if "checkpoints.json" not in names:
+        continue
+    try:
+        doc = json.load(open(os.path.join(root, "checkpoints.json")))
+    except Exception:                              # noqa: BLE001
+        continue
+    for entry in doc.get("checkpoints", []):
+        pair = (entry.get("fingerprint") or {}).get("device_and_inode")
+        if pair and len(pair) == 2:
+            by_inode[(pair[0], pair[1])] = entry.get("position")
+    break
+
+dropped = stalled = 0
 for path in sorted(files):
     derived = NAME.sub('', os.path.basename(path))
-    mark = "collected" if derived in selected else "DROPPED — not a selected service"
-    if derived not in selected:
-        bad += 1
-    print(f"                 {os.path.basename(path):<52} -> {derived!r}  {mark}")
+    keep = derived in selected
 
-if bad:
+    try:
+        st = os.stat(path)
+        size, pos = st.st_size, by_inode.get((st.st_dev, st.st_ino))
+    except OSError:
+        size, pos = None, None
+
+    if not keep:
+        where, dropped = "DROPPED — not a selected service", dropped + 1
+    elif size is None:
+        where = "collected — cannot stat the file"
+    elif pos is None:
+        where = f"collected — no checkpoint yet, size {size}"
+    elif pos > size:
+        where, stalled = (f"STALLED — reading at {pos}, file is only {size}",
+                          stalled + 1)
+    else:
+        where = f"collected — at {pos} of {size}"
+
+    print(f"                 {os.path.basename(path):<52} -> {derived!r}")
+    print(f"                 {'':<52}    {where}")
+
+if dropped:
     print()
     print("                 A DROPPED line means the collector reads that file and the")
     print("                 service filter throws every line away. Either the name is")
     print("                 not in the selected list, or the parser does not recognise")
     print("                 the filename — which is what a rotated log looks like on an")
-    print("                 agent older than 1.13.0. Update the agent, then:")
-    print("                   logagent reload")
+    print("                 agent older than 1.13.0.")
+
+if stalled:
+    print()
+    print("                 A STALLED line is the rotation failure: the collector holds")
+    print("                 a position from the larger pre-rotation file and is waiting")
+    print("                 for the new one to grow past it. It will store nothing until")
+    print("                 then, which for a log that rotates daily is never. Fix:")
+    print("                   systemctl stop vector")
+    print(f"                   rm {os.path.join(state, 'checkpoints.json')}  # or wherever it sits under {state}")
+    print("                   systemctl start vector")
+    print("                 Lines written before the restart are not recovered.")
 PY
 
   # A file being written that stores nothing is always the collector, and the
@@ -597,7 +648,13 @@ PY
   #   permission or ignore_older_secs problem, and clearing checkpoints would
   #   change nothing.
   if [ -n "$STUCK_FILES" ]; then
-    bad "a log file is being written but nothing from it is being stored"
+    # The verdict is softened after a fresh restart; the inspection below is not.
+    if [ "${UP_SECS:-99999}" -lt 180 ]; then
+      info "a log file is being written and has stored nothing yet — the collector"
+      info "restarted ${UP_SECS}s ago, so this is not yet a fault. Details:"
+    else
+      bad "a log file is being written but nothing from it is being stored"
+    fi
     # Argument, not a pipe — see the note above the file-name map. Piped in, the
     # heredoc ate it and this printed the FAIL headline with nothing under it,
     # which is worse than not running: it looks like the check found nothing to
