@@ -471,6 +471,7 @@ except Exception:
 PY
 )
   NOW_EPOCH=$(date +%s)
+  STUCK_FILES=""
 
   # Read into an array, NOT `printf … | while read`. pgq is `docker exec -i`,
   # which attaches stdin and drains it — inside a read loop fed by a pipe it
@@ -508,7 +509,17 @@ PY
       detail="log written $when, ${size} bytes"
       # A file that has not been touched in an hour cannot produce rows in the
       # last hour. Saying so removes the only other suspect.
-      [ "${rows:-0}" -eq 0 ] && [ "$age" -gt 3600 ] && detail="$detail — service is silent"
+      if [ "${rows:-0}" -eq 0 ] && [ "$age" -gt 3600 ]; then
+        detail="$detail — service is silent"
+      elif [ "${rows:-0}" -eq 0 ] && [ "$age" -lt 600 ]; then
+        # The one combination that is unambiguously a collector fault: the file
+        # is being written right now and not one line of it was stored. Every
+        # other check passes in this state — the unit is active, the config
+        # validates, the database is healthy — so without saying it here the
+        # only symptom is a chart that stops.
+        detail="$detail — WRITTEN BUT NOT COLLECTED"
+        STUCK_FILES="${STUCK_FILES}${svc}"$'\t'"$(printf '%s' "$newest" | cut -d' ' -f3-)"$'\n'
+      fi
     elif docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF "$svc"; then
       detail="docker container — logs come from the docker socket, not a file"
     else
@@ -517,6 +528,77 @@ PY
 
     printf '                 %-32s %6s rows   %s\n' "$svc" "${rows:-0}" "$detail"
   done
+
+  # A file being written that stores nothing is always the collector, and the
+  # collector keeps its position in a checkpoint file. Comparing that position
+  # to the file's current size separates the two ways this happens, which need
+  # opposite fixes:
+  #
+  #   position far beyond the size — the file was rotated or truncated under
+  #   Vector while it held an offset from the old, larger file. It will store
+  #   nothing until the new file grows past the old one's length, which for a
+  #   rotated log never happens. Clearing the checkpoint fixes it.
+  #
+  #   no checkpoint at all — Vector is not watching the file. That is a glob,
+  #   permission or ignore_older_secs problem, and clearing checkpoints would
+  #   change nothing.
+  if [ -n "$STUCK_FILES" ]; then
+    bad "a log file is being written but nothing from it is being stored"
+    printf '%s' "$STUCK_FILES" | python3 - "$STATE/vector" <<'PY'
+import json, os, sys
+
+state = sys.argv[1]
+path = os.path.join(state, "checkpoints.json")
+try:
+    doc = json.load(open(path))
+except Exception as exc:                       # noqa: BLE001
+    print(f"          cannot read {path}: {exc}")
+    sys.exit(0)
+
+# Keyed by whichever fingerprint strategy is in force. device_and_inode stores
+# the pair; a checksum stores a number. Index both so this reports either way.
+by_inode, positions = {}, []
+for entry in doc.get("checkpoints", []):
+    fp = entry.get("fingerprint") or {}
+    pos = entry.get("position")
+    positions.append(pos)
+    pair = fp.get("device_and_inode")
+    if pair and len(pair) == 2:
+        by_inode[(pair[0], pair[1])] = pos
+
+for line in sys.stdin.read().splitlines():
+    if "\t" not in line:
+        continue
+    svc, file_path = line.split("\t", 1)
+    try:
+        st = os.stat(file_path)
+    except OSError as exc:                     # noqa: BLE001
+        print(f"          {svc}: cannot stat {file_path}: {exc}")
+        continue
+
+    pos = by_inode.get((st.st_dev, st.st_ino))
+    print(f"          {svc}")
+    print(f"            file      {file_path}")
+    print(f"            size      {st.st_size} bytes   inode {st.st_ino}")
+    if pos is None:
+        print("            checkpoint  NONE — the collector is not watching this")
+        print("            file at all. Check that its directory is in the pm2")
+        print("            include list and that it is readable.")
+    elif pos > st.st_size:
+        print(f"            checkpoint  {pos} — BEYOND the end of the file.")
+        print("            The file was rotated or truncated while the collector")
+        print("            held a position in the larger original, so it is")
+        print("            waiting for the file to grow past that point. Fix:")
+        print("              systemctl stop vector")
+        print(f"              rm {path}")
+        print("              systemctl start vector")
+        print("            Lines written before the restart are not recovered.")
+    else:
+        print(f"            checkpoint  {pos} — inside the file, so the collector")
+        print("            is positioned correctly and something later in the")
+        print("            pipeline is dropping these lines. Send this output on.")
+PY
+  fi
 
   # ── rollup freshness ───────────────────────────────────────────────────────
   #
