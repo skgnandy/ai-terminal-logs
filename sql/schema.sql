@@ -303,3 +303,50 @@ ALTER TABLE log_rollup ADD COLUMN IF NOT EXISTS apdex_s    int DEFAULT 0;
 ALTER TABLE log_rollup ADD COLUMN IF NOT EXISTS apdex_t    int DEFAULT 0;
 
 INSERT INTO schema_version (version) VALUES (5) ON CONFLICT DO NOTHING;
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- schema v6 — errors over a window
+--
+-- error_groups.occurrences is a lifetime total that only ever grows, and the
+-- table outlives raw logs by 90 days. On a dashboard showing the last 24 hours
+-- that reads as a frozen number: an error last seen minutes ago sits at the top
+-- with a count accumulated over weeks, dwarfing everything that is actually
+-- happening now, and looking identical on every refresh.
+--
+-- One row per group per five minutes makes the count answer the question the
+-- window asks. The lifetime total stays on error_groups — it is the right
+-- number for "has this ever been seen", just not for "what is breaking today".
+-- The fingerprint lives here, once. It is computed in the five-minute rollup and
+-- again when seeding history, and those two must agree exactly — a fingerprint
+-- that differs by one character silently splits an error into two groups whose
+-- counts each look wrong. A function is the only way to guarantee they cannot
+-- drift apart.
+--
+-- IMMUTABLE because it is a pure function of its arguments; that is also what
+-- lets it be used in an index expression later without rewriting anything.
+CREATE OR REPLACE FUNCTION error_fp(p_service text, p_body text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+  SELECT md5(
+    p_service || '|' ||
+    regexp_replace(
+      regexp_replace(
+        regexp_replace(
+          regexp_replace(split_part(p_body, E'\n', 1),
+            '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<uuid>', 'g'),
+          '\m[0-9a-fA-F]{12,}\M', '<hex>', 'g'),
+        '"[^"]*"', '<str>', 'g'),
+      '\m\d+\M', '<n>', 'g')
+  );
+$$;
+
+CREATE TABLE IF NOT EXISTS error_group_bucket (
+  bucket      timestamptz NOT NULL,
+  fp          text NOT NULL,
+  occurrences int NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket, fp)
+);
+
+CREATE INDEX IF NOT EXISTS error_group_bucket_ts ON error_group_bucket (bucket DESC);
+
+INSERT INTO schema_version (version) VALUES (6) ON CONFLICT DO NOTHING;

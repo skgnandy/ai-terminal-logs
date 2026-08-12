@@ -225,37 +225,76 @@ fi
 # of five is that a line arriving more than five minutes late is missed from
 # the count; an inflated count is worse, because it is wrong every time rather
 # than rarely.
+# One-time seed of the per-window counts from whatever raw history is still
+# retained. Without it the errors panel is empty on the first run after the
+# upgrade and fills in only as new errors arrive, which on a quiet service reads
+# as the feature being broken.
+#
+# Guarded by the table being empty, so it runs exactly once. It is additive, and
+# a second run would double every count it had already written.
+pgx <<'SQL' >/dev/null
+INSERT INTO error_group_bucket (bucket, fp, occurrences)
+SELECT date_bin(interval '5 minutes', ts, timestamptz '2000-01-01'),
+       error_fp(service, body), count(*)
+FROM log_entries
+WHERE severity IN ('ERROR','FATAL')
+  AND NOT EXISTS (SELECT 1 FROM error_group_bucket)
+GROUP BY 1, 2
+ON CONFLICT (bucket, fp) DO NOTHING;
+SQL
+
 if [ "$BACKFILL_DAYS" -eq 0 ]; then
 pgx <<'SQL' >/dev/null
 WITH normalised AS (
   SELECT
-    md5(
-      service || '|' ||
-      regexp_replace(
-        regexp_replace(
-          regexp_replace(
-            regexp_replace(split_part(body, E'\n', 1),
-              '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<uuid>', 'g'),
-            '\m[0-9a-fA-F]{12,}\M', '<hex>', 'g'),
-          '"[^"]*"', '<str>', 'g'),
-        '\m\d+\M', '<n>', 'g')
-    ) AS fp,
+    error_fp(service, body) AS fp,
     host, service, severity,
     split_part(body, E'\n', 1) AS sample,
     ts
   FROM log_entries
   WHERE ts > now() - interval '5 minutes'
     AND severity IN ('ERROR','FATAL')
+),
+-- DISTINCT ON, not min(sample). `min` picks the alphabetically smallest line in
+-- the group, which is nobody's idea of a representative one: for a message that
+-- leads with a timestamp it reliably picks the OLDEST wording and pins it there
+-- for as long as the group lives.
+latest AS (
+  SELECT DISTINCT ON (fp) fp, left(sample, 500) AS sample
+  FROM normalised
+  ORDER BY fp, ts DESC
+),
+counted AS (
+  SELECT fp, min(host) AS host, min(service) AS service,
+         min(severity) AS severity,
+         min(ts) AS first_seen, max(ts) AS last_seen, count(*) AS n
+  FROM normalised
+  GROUP BY fp
+),
+-- Written before the group upsert and in the same statement, so a group can
+-- never exist with no window counts behind it.
+bucketed AS (
+  INSERT INTO error_group_bucket (bucket, fp, occurrences)
+  SELECT date_bin(interval '5 minutes', ts, timestamptz '2000-01-01'), fp, count(*)
+  FROM normalised
+  GROUP BY 1, 2
+  ON CONFLICT (bucket, fp) DO UPDATE SET
+    occurrences = error_group_bucket.occurrences + EXCLUDED.occurrences
+  RETURNING 1
 )
 INSERT INTO error_groups (fp, host, service, severity, sample,
                           first_seen, last_seen, occurrences)
-SELECT fp, min(host), min(service), min(severity),
-       min(left(sample, 500)), min(ts), max(ts), count(*)
-FROM normalised
-GROUP BY fp
+SELECT c.fp, c.host, c.service, c.severity, l.sample,
+       c.first_seen, c.last_seen, c.n
+FROM counted c JOIN latest l USING (fp)
 ON CONFLICT (fp) DO UPDATE SET
   last_seen   = GREATEST(error_groups.last_seen, EXCLUDED.last_seen),
   occurrences = error_groups.occurrences + EXCLUDED.occurrences,
+  -- Refreshed, not kept. A frozen sample means the panel shows a line from days
+  -- ago beside a "last seen: now", and the reader concludes the panel is stale
+  -- when the error is in fact current. Only ever moves forward.
+  sample      = CASE WHEN EXCLUDED.last_seen >= error_groups.last_seen
+                     THEN EXCLUDED.sample ELSE error_groups.sample END,
   -- A group marked resolved that recurs must reopen, or regressions stay hidden.
   state       = CASE WHEN error_groups.state = 'resolved' THEN 'open'
                      ELSE error_groups.state END;
@@ -270,6 +309,9 @@ pgq -c "DELETE FROM log_rollup   WHERE bucket    < now() - interval '90 days';" 
 # every "is this endpoint slower than it was last month" question.
 pgq -c "DELETE FROM endpoint_rollup WHERE bucket  < now() - interval '30 days';" >/dev/null 2>&1 || true
 pgq -c "DELETE FROM error_groups WHERE last_seen < now() - interval '90 days';" >/dev/null 2>&1 || true
+# Shorter than error_groups: this is one row per group per five minutes and only
+# ever read through a dashboard window, the widest of which is 7 days.
+pgq -c "DELETE FROM error_group_bucket WHERE bucket < now() - interval '30 days';" >/dev/null 2>&1 || true
 
 # db_metrics is a plain table rather than partitioned (a few dozen rows per 10
 # minutes), so it is pruned here instead of by partition maintenance.
