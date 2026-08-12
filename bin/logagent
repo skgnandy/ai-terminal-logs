@@ -332,6 +332,31 @@ json.dump(c, open(p,'w'), indent=2)" "$CONF"
   echo '{"paused":false}'
 }
 
+# Clearing the read positions is the recovery for a source that a rotation left
+# behind: the collector holds an offset from the pre-rotation file and waits for
+# the new, smaller one to grow past it, which for a daily rotation never happens.
+# It is a command rather than an instruction because the path it has to delete is
+# an internal detail nobody should be asked to know, and guessing it wrong (as
+# happened once) wastes a whole round trip on a machine that is losing logs.
+cmd_rewind() {
+  local dir="$STATE/vector" n=0
+  systemctl stop vector >/dev/null 2>&1 || true
+
+  if [ -d "$dir" ]; then
+    n=$(find "$dir" -name 'checkpoints.json*' -type f -print -delete 2>/dev/null | wc -l)
+  fi
+
+  systemctl start vector >/dev/null 2>&1 || true
+  if systemctl is-active --quiet vector; then
+    log "cleared $n checkpoint file(s); collection restarts at the end of each log"
+  else
+    warn "checkpoints cleared but vector is NOT running — logagent doctor"
+  fi
+
+  audit rewind "cleared $n checkpoint file(s)"
+  printf '{"cleared":%s}\n' "$n"
+}
+
 cmd_uninstall() {
   [ "${1:-}" = "--yes" ] || die "refusing without --yes"
 
@@ -375,6 +400,7 @@ case "${1:-status}" in
   probe)     bash "$LIB_DIR/probes.sh" ;;
   rollup)    shift; bash "$LIB_DIR/rollup.sh" "$@" ;;
   reload)    bash "$LIB_DIR/vector-config.sh" ;;
+  rewind)    cmd_rewind ;;
   maintain)  bash "$LIB_DIR/partitions.sh" ;;
   uninstall) shift; cmd_uninstall "${1:-}" ;;
   version)   cat /opt/ai-terminal-logs/VERSION 2>/dev/null || echo unknown ;;
@@ -399,6 +425,10 @@ usage: logagent <command>
   notify "<message>" ['<data>'] send a test alert through every channel
   pause | resume                stop or start collection (data retained)
   reload                        regenerate vector config
+  rewind                        forget where the collector is reading in every
+                                log file and start from the end of each. Fixes a
+                                source stuck behind a rotation. Nothing already
+                                stored is lost; nothing missed is recovered
   maintain                      run partition maintenance now
   uninstall --yes               remove everything, credentials included
   version
