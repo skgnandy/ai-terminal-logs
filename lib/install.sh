@@ -152,6 +152,14 @@ systemctl enable --now ai-terminal-rollup.timer     >/dev/null 2>&1 || true
 systemctl enable --now ai-terminal-alerts.timer     >/dev/null 2>&1 || true
 systemctl enable --now ai-terminal-probes.timer     >/dev/null 2>&1 || true
 
+# `enable --now` on an already-running timer is a no-op, so a changed schedule
+# would not take effect until the next reboot. Restarting them is what makes an
+# upgrade that shortens the watchdog interval actually shorten it on the machine
+# being upgraded — which is the whole reason for changing it.
+for t in partitions watchdog metrics rollup alerts probes; do
+  systemctl restart "ai-terminal-$t.timer" >/dev/null 2>&1 || true
+done
+
 # ── 7. first partitions + vector config ──────────────────────────────────────
 bash "$PREFIX/lib/partitions.sh" >/dev/null 2>&1 || warn "initial partition creation failed"
 

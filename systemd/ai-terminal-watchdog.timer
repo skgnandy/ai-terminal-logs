@@ -1,10 +1,21 @@
 [Unit]
-Description=ai-terminal watchdog (every 5 minutes)
+Description=ai-terminal watchdog (every 2 minutes, and right after log rotation)
 Documentation=https://github.com/skgnandy/ai-terminal-logs
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+# Two minutes, not five. This interval IS the amount of log lost when collection
+# stops, so it is the number the user actually experiences on a bad night.
+OnUnitActiveSec=2min
+
+# pm2-logrotate runs at midnight, and all three collection failures so far began
+# within seconds of it. The periodic timer would reach it anyway; these make the
+# check land immediately at the one moment it is known to break, and again after,
+# in case the first recovery did not take.
+OnCalendar=*-*-* 00:01:00
+OnCalendar=*-*-* 00:04:00
+OnCalendar=*-*-* 00:10:00
+Persistent=false
 
 [Install]
 WantedBy=timers.target

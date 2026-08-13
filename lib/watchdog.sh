@@ -134,8 +134,22 @@ recover_position() {
 # are supposed to be collecting writing to its log right now and storing nothing?
 # That is true of every way this can fail, including the ones not yet seen.
 silent_while_writing() {
-  local svc esc rows newest age now
+  local svc esc rows newest age now since up
   now=$(date +%s)
+
+  # A collector that has just restarted is not a collector that is failing.
+  #
+  # pm2 file sources read from the end, so a line written shortly BEFORE a
+  # restart is never collected — leaving a service that has written recently and
+  # stored nothing, which is exactly this check's trigger. Without this guard the
+  # recovery restart satisfies its own condition and the watchdog restarts the
+  # collector on a loop. Five minutes is long enough for any service that is
+  # writing at all to produce a row.
+  since=$(systemctl show vector -p ActiveEnterTimestamp --value 2>/dev/null || true)
+  if [ -n "$since" ]; then
+    up=$(date -d "$since" +%s 2>/dev/null || echo 0)
+    [ "${up:-0}" -gt 0 ] && [ $(( now - up )) -lt 300 ] && return 0
+  fi
 
   while IFS= read -r svc; do
     # A stray carriage return survives into the filename patterns below and
@@ -177,9 +191,10 @@ PY
 }
 
 # Restarting the collector is cheap and safe — it resumes from its saved
-# positions — but it must not become a loop. Half an hour between attempts means
-# a genuine, unfixable fault is reported by the notification rather than hidden
-# behind a restart every five minutes.
+# positions — but it must not become a loop. Fifteen minutes between attempts
+# means a genuine, unfixable fault is reported by the notification rather than
+# hidden behind a restart every couple of minutes, while still allowing a second
+# and third attempt inside the hour after a bad rotation.
 RECOVER_STAMP="$STATE/last-collector-recovery"
 
 recover_collector() {
@@ -187,7 +202,7 @@ recover_collector() {
   now=$(date +%s)
   [ -f "$RECOVER_STAMP" ] && last=$(cat "$RECOVER_STAMP" 2>/dev/null || echo 0)
 
-  if [ $(( now - ${last:-0} )) -lt 1800 ]; then
+  if [ $(( now - ${last:-0} )) -lt 900 ]; then
     warn "collection still silent for: $services (restarted recently, not retrying yet)"
     return 0
   fi
