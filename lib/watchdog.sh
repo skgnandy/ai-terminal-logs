@@ -13,6 +13,11 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
+# Where pm2 keeps its logs. A variable, and unquoted at every use so the glob
+# expands, because the recovery paths below are worth testing against a fixture
+# directory instead of only on a machine that is already broken.
+PM2_DIRS=${AI_TERMINAL_PM2_DIRS:-"/root/.pm2/logs /home/*/.pm2/logs"}
+
 THRESH_TRIM=15   # % free — drop one partition
 THRESH_HARD=10   # % free — drop two
 THRESH_STOP=8    # % free — stop collecting entirely
@@ -57,7 +62,7 @@ drop_oldest() {
 #
 # Prints the offending file and returns 0 when one is found.
 stalled_position() {
-  python3 - "$STATE/vector" <<'PY'
+  python3 - "$STATE/vector" "$PM2_DIRS" <<'PY'
 import glob, json, os, sys, time
 
 state = sys.argv[1]
@@ -81,21 +86,22 @@ for entry in doc.get("checkpoints", []):
         pos[(pair[0], pair[1])] = entry.get("position") or 0
 
 now = time.time()
-for directory in ["/root/.pm2/logs"] + glob.glob("/home/*/.pm2/logs"):
-    for path in glob.glob(os.path.join(directory, "*.log")):
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        saved = pos.get((st.st_dev, st.st_ino))
-        # Only a file being written right now. One sitting idle below its
-        # recorded position loses nothing, and restarting the collector over it
-        # would throw away every other file's position for no gain.
-        if saved is None or now - st.st_mtime > 600:
-            continue
-        if saved > st.st_size:
-            print(f"{path} (reading at {saved}, file is {st.st_size})")
-            raise SystemExit(0)
+for pattern in sys.argv[2].split():
+    for directory in sorted(glob.glob(pattern)) or [pattern]:
+        for path in glob.glob(os.path.join(directory, "*.log")):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            saved = pos.get((st.st_dev, st.st_ino))
+            # Only a file being written right now. One sitting idle below its
+            # recorded position loses nothing, and restarting the collector over
+            # it would throw away every other file's position for no gain.
+            if saved is None or now - st.st_mtime > 600:
+                continue
+            if saved > st.st_size:
+                print(f"{path} (reading at {saved}, file is {st.st_size})")
+                raise SystemExit(0)
 
 raise SystemExit(1)
 PY
@@ -115,12 +121,95 @@ recover_position() {
   notify "${HOST_NAME:-host}: log collection had stalled after a rotation and was restarted. $stalled"
 }
 
+# The outcome check, and the one that matters.
+#
+# The position guard above catches one mechanism — the one that had already
+# happened. The next rotation broke collection a different way: ~106 files were
+# created at once, the collector discovered them, and five seconds later it was
+# reading nothing at all, holding no position for the live files it had been
+# following. `position > size` was never true, so nothing fired, and it stayed
+# down for eight hours.
+#
+# So this asks the question the mechanism-specific check cannot: is a service we
+# are supposed to be collecting writing to its log right now and storing nothing?
+# That is true of every way this can fail, including the ones not yet seen.
+silent_while_writing() {
+  local svc esc rows newest age now
+  now=$(date +%s)
+
+  while IFS= read -r svc; do
+    # A stray carriage return survives into the filename patterns below and
+    # silently matches nothing, which would switch this check off for that
+    # service while looking like it ran. The name comes from a JSON file the app
+    # writes, so it is not ours to assume clean.
+    svc=${svc%$'\r'}
+    [ -n "$svc" ] || continue
+    esc=$(printf '%s' "$svc" | sed "s/'/''/g")
+
+    # </dev/null: pgq is `docker exec -i`, which drains the loop's stdin.
+    rows=$(pgq -c "SELECT count(*) FROM log_entries
+                   WHERE service = '$esc' AND ts > now() - interval '15 minutes';" \
+                 </dev/null 2>/dev/null || echo 1)
+    [ "${rows:-1}" -eq 0 ] || continue
+
+    newest=$(find $PM2_DIRS -maxdepth 1 -type f \
+               \( -name "$svc-out*.log" -o -name "$svc-error*.log" -o -name "$svc.log" \) \
+               -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+    [ -n "$newest" ] || continue
+
+    # Two minutes, not ten. A service that logs in bursts can be quiet for a
+    # while legitimately; one written to within the last two minutes that has
+    # stored nothing for fifteen is not quiet, it is not being collected.
+    age=$(( now - ${newest%%.*} ))
+    [ "$age" -lt 120 ] || continue
+
+    printf '%s\n' "$svc"
+  done < <(python3 - "$CONF" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    for s in (json.load(open(sys.argv[1])).get("logServices") or []):
+        if s:
+            print(s)
+except Exception:                                  # noqa: BLE001
+    pass
+PY
+  )
+}
+
+# Restarting the collector is cheap and safe — it resumes from its saved
+# positions — but it must not become a loop. Half an hour between attempts means
+# a genuine, unfixable fault is reported by the notification rather than hidden
+# behind a restart every five minutes.
+RECOVER_STAMP="$STATE/last-collector-recovery"
+
+recover_collector() {
+  local services="$1" last=0 now
+  now=$(date +%s)
+  [ -f "$RECOVER_STAMP" ] && last=$(cat "$RECOVER_STAMP" 2>/dev/null || echo 0)
+
+  if [ $(( now - ${last:-0} )) -lt 1800 ]; then
+    warn "collection still silent for: $services (restarted recently, not retrying yet)"
+    return 0
+  fi
+
+  printf '%s' "$now" > "$RECOVER_STAMP"
+  systemctl restart vector >/dev/null 2>&1 || true
+
+  audit collector_restart "silent while writing: $services"
+  log "restarted vector — writing but storing nothing: $services"
+  notify "${HOST_NAME:-host}: log collection had stopped for $services and the collector was restarted"
+}
+
 main() {
   docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER" || exit 0
 
-  local stalled
+  # Position first: it needs the checkpoints cleared, which a restart alone
+  # would not do, and it would otherwise be misread as the general case below.
+  local stalled silent
   if stalled=$(stalled_position); then
     recover_position "$stalled"
+  elif silent=$(silent_while_writing) && [ -n "$silent" ]; then
+    recover_collector "$(printf '%s' "$silent" | tr '\n' ' ')"
   fi
 
   local free dropped
