@@ -1,5 +1,12 @@
 -- ai-terminal-logs schema
 --
+-- Every object here is CREATE IF NOT EXISTS, so re-applying it on an update
+-- emits forty "relation already exists, skipping" notices. That is a screenful
+-- of red-looking output on a routine upgrade, and it teaches the reader to skim
+-- past exactly the place a real error would appear. Warnings and errors still
+-- print.
+SET client_min_messages TO warning;
+
 -- Two design choices dominate this file:
 --
 --   PARTITION BY RANGE (ts) — retention is DROP TABLE, which returns disk
