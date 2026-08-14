@@ -205,6 +205,26 @@ for t in metrics rollup partitions alerts probes watchdog; do
   fi
 done
 
+# Exit status is not evidence that the work happened. The watchdog once aborted
+# on its first step inside a command substitution: the script still exited 0,
+# systemd recorded "success", this section said so, and nothing had been checked
+# for a day. So read the stamp it writes as its final act instead of asking
+# systemd whether it finished.
+WD_STAMP="$STATE/watchdog-last"
+if [ -f "$WD_STAMP" ]; then
+  WD_AGE=$(( $(date +%s) - $(cat "$WD_STAMP" 2>/dev/null || echo 0) ))
+  if [ "$WD_AGE" -lt 600 ]; then
+    ok "watchdog ran to completion $((WD_AGE / 60))m ago"
+  else
+    bad "watchdog has not completed a run in $((WD_AGE / 60))m — it is exiting"
+    bad "early, so nothing is guarding collection. See:"
+    bad "  systemctl start ai-terminal-watchdog.service; journalctl -u ai-terminal-watchdog"
+  fi
+elif systemctl cat ai-terminal-watchdog.timer >/dev/null 2>&1; then
+  info "watchdog has not completed a run since this stamp was introduced (1.17.1);"
+  info "it appears after the next run, within a couple of minutes."
+fi
+
 head_ "database"
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"; then
   ok "container      $PG_CONTAINER running on 127.0.0.1:${PG_PORT:-unset}"

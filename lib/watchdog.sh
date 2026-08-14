@@ -13,10 +13,27 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
-# Where pm2 keeps its logs. A variable, and unquoted at every use so the glob
-# expands, because the recovery paths below are worth testing against a fixture
-# directory instead of only on a machine that is already broken.
+# Where pm2 keeps its logs. A variable so the recovery paths below can be tested
+# against a fixture directory instead of only on a machine that is already
+# broken.
 PM2_DIRS=${AI_TERMINAL_PM2_DIRS:-"/root/.pm2/logs /home/*/.pm2/logs"}
+
+# Only the ones that actually exist, and this is not tidiness.
+#
+# Most machines have /root/.pm2/logs and no /home/*/.pm2/logs. Handing the
+# missing one to `find` makes it exit non-zero; `pipefail` carries that through
+# the pipeline, `set -e` aborts on the assignment, and because the caller runs
+# inside a command substitution the surrounding script still exits 0. The
+# watchdog died on its first step every single run, reported success to systemd,
+# and recovered nothing for a whole day while looking healthy — the exact
+# failure mode this file exists to prevent, in the file that prevents it.
+existing_pm2_dirs() {
+  local d out=""
+  for d in $PM2_DIRS; do
+    [ -d "$d" ] && out="$out $d"
+  done
+  printf '%s' "${out# }"
+}
 
 THRESH_TRIM=15   # % free — drop one partition
 THRESH_HARD=10   # % free — drop two
@@ -134,8 +151,11 @@ recover_position() {
 # are supposed to be collecting writing to its log right now and storing nothing?
 # That is true of every way this can fail, including the ones not yet seen.
 silent_while_writing() {
-  local svc esc rows newest age now since up
+  local svc esc rows newest age now since up dirs
   now=$(date +%s)
+
+  dirs=$(existing_pm2_dirs)
+  [ -n "$dirs" ] || return 0
 
   # A collector that has just restarted is not a collector that is failing.
   #
@@ -166,9 +186,12 @@ silent_while_writing() {
                  </dev/null 2>/dev/null || echo 1)
     [ "${rows:-1}" -eq 0 ] || continue
 
-    newest=$(find $PM2_DIRS -maxdepth 1 -type f \
+    # `|| true` as well as the filtered directory list. A file vanishing between
+    # the glob and the stat is normal during rotation, and this check must not
+    # be the thing that stops working when logs are rotating.
+    newest=$(find $dirs -maxdepth 1 -type f \
                \( -name "$svc-out*.log" -o -name "$svc-error*.log" -o -name "$svc.log" \) \
-               -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+               -printf '%T@\n' 2>/dev/null | sort -rn | head -1 || true)
     [ -n "$newest" ] || continue
 
     # Two minutes, not ten. A service that logs in bursts can be quiet for a
@@ -250,6 +273,15 @@ PY
     dropped=$(drop_oldest || true)
     [ -n "$dropped" ] && notify "${HOST_NAME:-host} disk ${free}% free — dropped log partition ${dropped}"
   fi
+
+  # Written last, so it only appears if everything above actually ran.
+  #
+  # This is the lesson from the day the watchdog was dead. It aborted on its
+  # first step, inside a command substitution, so the script still exited 0 and
+  # systemd recorded a successful run. "Last run: success" meant nothing. A
+  # timestamp written at the end cannot be forged by a script that died in the
+  # middle, and doctor reports how old it is.
+  printf '%s\n' "$(date +%s)" > "$STATE/watchdog-last" 2>/dev/null || true
 }
 
 main "$@"
