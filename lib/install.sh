@@ -116,8 +116,24 @@ install_vector() {
   # Only when the machine has no unit of its own: a distro-packaged Vector
   # already ships one, and replacing it would be a change to something the agent
   # does not own.
-  if systemctl cat vector >/dev/null 2>&1; then
-    log "vector service unit already present"
+  #
+  # "Already present" is not the same as "already ours". An upgrade that changes
+  # this unit — a resource limit, a restart policy — would never reach a machine
+  # the agent had already installed on, which is every machine that has been
+  # running long enough to hit the problem the change fixes. So: install when
+  # there is no unit, refresh when the unit is one we wrote, and never touch a
+  # distro-packaged one.
+  if [ -f /etc/systemd/system/vector.service ] &&
+     grep -q 'ai-terminal-logs collector' /etc/systemd/system/vector.service; then
+    log "refreshing our vector service unit"
+    sed "s#VECTOR_BIN#$(command -v vector)#" "$PREFIX/systemd/vector.service" \
+      > /etc/systemd/system/vector.service
+    chmod 644 /etc/systemd/system/vector.service
+    systemctl daemon-reload
+    # daemon-reload alone leaves the running process on the old limits.
+    systemctl restart vector >/dev/null 2>&1 || true
+  elif systemctl cat vector >/dev/null 2>&1; then
+    log "vector service unit is not ours — leaving it alone"
   else
     log "installing vector service unit"
     sed "s#VECTOR_BIN#$(command -v vector)#" "$PREFIX/systemd/vector.service" \

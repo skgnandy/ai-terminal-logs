@@ -65,7 +65,26 @@ EOF
 type = "file"
 include = [ $PM2_LOG_DIRS_CSV ]
 read_from = "end"
-ignore_older_secs = 86400      # never replay a year-old backlog on first start
+# Fifteen minutes, not a day, and this is the fix for the nightly outage rather
+# than a tuning knob.
+#
+# pm2-logrotate creates a file per process per stream at midnight — 106 of them
+# at once on the machine this was found on. Every one is freshly modified, so a
+# 24-hour window meant all of them entered the watch set together, on top of the
+# 136 already there. Collection stopped within five seconds of that and did not
+# come back on its own.
+#
+# This bounds the watch set by what is actually being written instead of by what
+# exists: a rotated file drops out a quarter of an hour after anything last
+# touched it, while a rotated file that pm2 is still writing to stays watched
+# for exactly as long as it is still being written. The directory can grow to
+# thousands of files and the collector still follows only the handful that are
+# live.
+#
+# It cannot lose lines. Positions are keyed by inode and outlive the watch set,
+# so a file that goes quiet, drops out, and is written to again is rediscovered
+# and resumes from where it stopped rather than from the end.
+ignore_older_secs = 900
 # No include_file_metadata here. It is not an option of the file source, so
 # validation rejected the whole config and the collector was never started.
 # The path the parser needs arrives as .file anyway; file_key defaults to it.

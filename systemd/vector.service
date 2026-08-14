@@ -24,5 +24,13 @@ KillMode=mixed
 TimeoutStopSec=30
 Environment=VECTOR_LOG=info
 
+# pm2-logrotate creates a file per process per stream every night and keeps
+# thirty of each by default, so the directory this tails grows without bound —
+# 119 files one day, 136 the next. The usual 1024-descriptor soft limit is a
+# ceiling that walks closer every night, and a log collector that runs out of
+# descriptors fails in the worst way available: it stops reading and says
+# nothing.
+LimitNOFILE=65535
+
 [Install]
 WantedBy=multi-user.target
