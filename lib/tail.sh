@@ -41,11 +41,6 @@ wanted() {
   return 1
 }
 
-# Shared with the metric collector — see common.sh. Not redefined here: the two
-# must agree on what a service is called, or the same process appears twice in
-# the app under names that differ by a rotation stamp.
-svc_of_file() { svc_of_pm2_file "$1"; }
-
 # PM2 processes that exist right now. Empty when pm2 is absent or reports
 # nothing, in which case the file list is used unfiltered — a tail that shows
 # too much is recoverable, one that shows nothing is not.
@@ -93,37 +88,53 @@ stream() {
 # With several files tail announces each switch as "==> path <==", so one
 # process still attributes every line correctly — including continuation lines,
 # which belong to whichever file is currently selected.
+# Straight from pm2: every log file it says it is writing, and the name it gives
+# the process writing it. Walking ~/.pm2/logs instead missed every service whose
+# ecosystem file sets out_file elsewhere, and named the rest after their files.
 FILES=()
-shopt -s nullglob
-for dir in /root/.pm2/logs /home/*/.pm2/logs; do
-  [ -d "$dir" ] || continue
-  for f in "$dir"/*.log; do
-    # pm2-logrotate archives. Nothing will ever append to them, so tailing one
-    # holds a watch forever for no output — and with 65 files on this machine
-    # the archives were the majority of them.
-    is_rotated_log "$f" && continue
+SVCS=()
+while IFS=$'\t' read -r _mtime _size svc f; do
+  [ -n "$f" ] || continue
 
-    svc=$(svc_of_file "$f")
-    # Only processes PM2 currently has. A deleted or renamed app leaves its logs
-    # behind indefinitely, so the file list drifts further from reality the
-    # longer a machine lives.
-    is_live_pm2 "$svc" || continue
-    wanted "$svc" || continue
-    FILES+=("$f")
-  done
-done
-shopt -u nullglob
+  # pm2-logrotate archives. Nothing will ever append to them, so tailing one
+  # holds a watch forever for no output — and with 65 files on this machine
+  # the archives were the majority of them.
+  is_rotated_log "$f" && continue
+
+  # Only processes PM2 currently has. A deleted or renamed app leaves its logs
+  # behind indefinitely, so the file list drifts further from reality the
+  # longer a machine lives.
+  is_live_pm2 "$svc" || continue
+  wanted "$svc" || continue
+  FILES+=("$f")
+  SVCS+=("$svc")
+done < <(pm2_log_info files)
 
 if [ ${#FILES[@]} -gt 0 ]; then
+  # path -> the name pm2 gives it, handed to awk below. The filename is not
+  # always enough: a service whose ecosystem file sets out_file is named after
+  # its deployment, and deriving the name from that file labels every one of its
+  # lines with a service the app has never heard of.
+  NAMES=$(for i in "${!FILES[@]}"; do printf '%s\t%s\n' "${FILES[$i]}" "${SVCS[$i]}"; done)
+
   # -n 0: start at the end. A live view opens on what is happening now, not on a
   # replay of a 200 MB file. -F follows across rotation.
   #
   # stderr is kept and tagged rather than discarded. Hiding it is what made the
   # inotify exhaustion above invisible.
-  tail -F -n 0 "${FILES[@]}" 2>&1 | awk '
-    # Mirrors svc_of_pm2_file in common.sh — the rotation stamp has to come off
+  tail -F -n 0 "${FILES[@]}" 2>&1 | awk -v names="$NAMES" '
+    BEGIN {
+      n = split(names, rows, "\n")
+      for (i = 1; i <= n; i++) {
+        split(rows[i], kv, "\t")
+        if (kv[1] != "") svcof[kv[1]] = kv[2]
+      }
+    }
+    # pm2 first; the filename only for a path it did not report. The fallback
+    # mirrors svc_of_pm2_file in common.sh — the rotation stamp has to come off
     # before the stream suffix, or an archive reads as its own service.
     function svcname(p,  b) {
+      if (p in svcof) return svcof[p]
       b = p
       sub(/^.*\//, "", b)
       sub(/__[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/, "", b)
@@ -182,7 +193,7 @@ echo "__attached__	$(( ${#FILES[@]} + CONTAINERS ))"
 # Deduplicated because -out.log and -error.log are the same service, and cluster
 # mode adds a -<pm_id> file per worker.
 printf '__services__\t%s\n' "$(
-  { for f in ${FILES[@]+"${FILES[@]}"}; do svc_of_file "$f"; done
+  { printf '%s\n' ${SVCS[@]+"${SVCS[@]}"}
     printf '%s\n' ${WATCHED_CONTAINERS[@]+"${WATCHED_CONTAINERS[@]}"}
   } | grep -v '^$' | sort -u | paste -sd, -
 )"

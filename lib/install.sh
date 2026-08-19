@@ -38,9 +38,11 @@ detect
 install -d -m 755 "$STATE" "$STATE/vector"
 install -d -m 700 "$ETC"
 
+# Already complete patterns — detect asks PM2 where it writes rather than
+# appending /*.log to a directory anyone assumed.
 PM2_LOG_DIRS_CSV=""
-for d in ${PM2_LOG_DIRS[@]+"${PM2_LOG_DIRS[@]}"}; do
-  PM2_LOG_DIRS_CSV="$PM2_LOG_DIRS_CSV\"$d/*.log\", "
+for g in ${PM2_LOG_GLOBS[@]+"${PM2_LOG_GLOBS[@]}"}; do
+  PM2_LOG_DIRS_CSV="$PM2_LOG_DIRS_CSV\"$g\", "
 done
 PM2_LOG_DIRS_CSV="${PM2_LOG_DIRS_CSV%, }"
 

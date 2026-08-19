@@ -87,6 +87,48 @@ except Exception:
   done
 }
 
+# What PM2 itself says about where it writes logs.
+#
+# mode: globs (include patterns for the collector, one per line)
+#       map   (JSON of log-path stem -> service name, for the parser)
+#       files (<mtime>	<size>	<service>	<path>, newest first)
+#
+# Guessing ~/.pm2/logs is not enough. out_file / error_file in an ecosystem file
+# put a service's log anywhere on disk, and a machine configured that way looks
+# exactly like a machine with no PM2: the collector reads the directory it was
+# given, finds nothing but pm2-logrotate's own logs, and reports no error while
+# every selected service stores zero rows. Metrics come from `pm2 jlist` rather
+# than from files, so the app keeps showing five healthy processes beside empty
+# charts — see lib/pm2-logs.py for the rest of it.
+#
+# PM2_HOME and the binary search are needed here for the same reason as in
+# pm2_live_names above: under a systemd timer neither is on the environment.
+pm2_log_info() {
+  local mode="${1:-globs}" bin home
+  bin=$(find_pm2 2>/dev/null) || bin=""
+  {
+    if [ -n "$bin" ]; then
+      for home in /root/.pm2 /home/*/.pm2; do
+        [ -d "$home" ] || continue
+        PM2_HOME="$home" "$bin" jlist 2>/dev/null || true
+      done
+    fi
+  } | python3 "$LIB_DIR/pm2-logs.py" "$mode" 2>/dev/null || true
+}
+
+# Run one `find` per PM2 log location, wherever each of them lives. Extra
+# arguments are appended, so callers add their own predicates.
+pm2_find_logs() {
+  local pattern dir name
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    dir=$(dirname "$pattern")
+    name=$(basename "$pattern")
+    [ -d "$dir" ] || continue
+    find "$dir" -maxdepth 1 -type f -name "$name" "$@" 2>/dev/null || true
+  done < <(pm2_log_info globs)
+}
+
 # Service name for a PM2 log file.
 #
 # Strips the pm2-logrotate stamp before the stream suffix: a rotated file is

@@ -13,27 +13,11 @@ set -euo pipefail
 . /opt/ai-terminal-logs/lib/common.sh
 load_env
 
-# Where pm2 keeps its logs. A variable so the recovery paths below can be tested
-# against a fixture directory instead of only on a machine that is already
-# broken.
-PM2_DIRS=${AI_TERMINAL_PM2_DIRS:-"/root/.pm2/logs /home/*/.pm2/logs"}
-
-# Only the ones that actually exist, and this is not tidiness.
-#
-# Most machines have /root/.pm2/logs and no /home/*/.pm2/logs. Handing the
-# missing one to `find` makes it exit non-zero; `pipefail` carries that through
-# the pipeline, `set -e` aborts on the assignment, and because the caller runs
-# inside a command substitution the surrounding script still exits 0. The
-# watchdog died on its first step every single run, reported success to systemd,
-# and recovered nothing for a whole day while looking healthy — the exact
-# failure mode this file exists to prevent, in the file that prevents it.
-existing_pm2_dirs() {
-  local d out=""
-  for d in $PM2_DIRS; do
-    [ -d "$d" ] && out="$out $d"
-  done
-  printf '%s' "${out# }"
-}
+# Where pm2 keeps its logs — asked of pm2 rather than assumed, because a service
+# whose ecosystem file sets out_file writes nowhere near ~/.pm2/logs. Still a
+# variable so the recovery paths below can be tested against a fixture directory
+# instead of only on a machine that is already broken.
+PM2_DIRS=${AI_TERMINAL_PM2_DIRS:-$(pm2_log_info globs | tr '\n' ' ')}
 
 THRESH_TRIM=15   # % free — drop one partition
 THRESH_HARD=10   # % free — drop two
@@ -104,8 +88,13 @@ for entry in doc.get("checkpoints", []):
 
 now = time.time()
 for pattern in sys.argv[2].split():
-    for directory in sorted(glob.glob(pattern)) or [pattern]:
-        for path in glob.glob(os.path.join(directory, "*.log")):
+    # A pattern is either a directory — what the fixture override passes — or an
+    # include pattern naming the files themselves, which is what pm2 reports for
+    # a service that sets its own out_file.
+    for match in sorted(glob.glob(pattern)) or [pattern]:
+        paths = (glob.glob(os.path.join(match, "*.log"))
+                 if os.path.isdir(match) else [match])
+        for path in paths:
             try:
                 st = os.stat(path)
             except OSError:
@@ -151,11 +140,13 @@ recover_position() {
 # are supposed to be collecting writing to its log right now and storing nothing?
 # That is true of every way this can fail, including the ones not yet seen.
 silent_while_writing() {
-  local svc esc rows newest age now since up dirs
+  local svc esc rows newest age now since up index
   now=$(date +%s)
 
-  dirs=$(existing_pm2_dirs)
-  [ -n "$dirs" ] || return 0
+  # One line per pm2 log file on this machine: mtime, size, the service pm2 says
+  # writes it, and the path — newest first.
+  index=$(pm2_log_info files)
+  [ -n "$index" ] || return 0
 
   # A collector that has just restarted is not a collector that is failing.
   #
@@ -186,12 +177,12 @@ silent_while_writing() {
                  </dev/null 2>/dev/null || echo 1)
     [ "${rows:-1}" -eq 0 ] || continue
 
-    # `|| true` as well as the filtered directory list. A file vanishing between
-    # the glob and the stat is normal during rotation, and this check must not
-    # be the thing that stops working when logs are rotating.
-    newest=$(find $dirs -maxdepth 1 -type f \
-               \( -name "$svc-out*.log" -o -name "$svc-error*.log" -o -name "$svc.log" \) \
-               -printf '%T@\n' 2>/dev/null | sort -rn | head -1 || true)
+    # Matched through pm2's own file list rather than through a pattern built
+    # from the service name. A service whose log file is named after the
+    # deployment instead of after the process matches no such pattern, so this
+    # check quietly passed on exactly the machines that needed it. The index is
+    # newest first, so the first hit is the newest file.
+    newest=$(printf '%s\n' "$index" | awk -F'\t' -v s="$svc" '$3 == s { print $1; exit }')
     [ -n "$newest" ] || continue
 
     # Two minutes, not ten. A service that logs in bursts can be quiet for a

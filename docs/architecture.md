@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────── one machine ────────────────────────────┐
 │                                                                     │
-│  /root/.pm2/logs/*.log ──┐                                          │
+│  pm2 log paths ──────────┐   (asked of pm2, not assumed)            │
 │  /var/run/docker.sock ───┼──▶  Vector  ──▶  receiver.py  ──▶  PG    │
 │  journald ───────────────┤     ~40 MB       ~15 MB          ~200 MB │
 │  /var/log/nginx/*.log ───┘                                container │
@@ -26,6 +26,38 @@
 | `watchdog.sh` | emergency disk guard | oneshot |
 | `metrics.sh` | PM2 / Docker / host metrics | oneshot |
 | `logagent` | control surface for the app | — |
+
+## Where the log files are
+
+The PM2 log locations come from `pm2 jlist`, not from `~/.pm2/logs`, and
+`lib/pm2-logs.py` is the only place that decides them. A service whose ecosystem
+file sets `out_file` writes somewhere else entirely, and that machine is
+indistinguishable from one with no PM2 at all: the collector reads the directory
+it was given, finds nothing but pm2-logrotate's own logs, reports no error, and
+every selected service stores zero rows. Metrics keep working throughout — they
+come from `pm2 jlist` — so the app shows healthy processes beside empty charts.
+
+For the same reason the parser is handed a map of log path to PM2 process name.
+A file named after a deployment rather than after the process resolves to a name
+that is in no selected list, so every line of it is read correctly and thrown
+away by the filter. The map is empty on a default install, where the filename
+already carries the name.
+
+## What `vector validate` cannot tell you
+
+Validation checks the config's shape. A source's own startup checks run later,
+when Vector builds the topology, and a failure there rejects the WHOLE config —
+one unusable source stops PM2, Docker and journald together, with the unit
+exiting `78/CONFIG` and systemd restarting it forever.
+
+The case that has been seen is journald: Vector refuses
+`current_boot_only = false` against systemd 250 through 257. `vector validate`
+accepted that config, `logagent doctor` agreed it was valid, and the collector
+died on it every five seconds while the app reported a collector that was
+"restarting". So the generator reads the systemd version rather than trusting
+validation, `reload_vector` regenerates without the option if the collector
+refuses it anyway, and the doctor calls a restart count above five what it is —
+a crash loop that collects nothing from any source.
 
 ## Design decisions
 

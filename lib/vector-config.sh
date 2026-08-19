@@ -34,6 +34,37 @@ validate_config() {
   return 1
 }
 
+# systemd's own version number — 255 out of "systemd 255 (255.4-1ubuntu8.6)".
+# Empty when it cannot be read, which the caller treats as "change nothing".
+systemd_version() {
+  systemctl --version 2>/dev/null \
+    | awk 'NR==1 { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) { print $i; exit } }'
+}
+
+# May journald be asked for more than the current boot?
+#
+# Vector refuses `current_boot_only = false` against systemd 250 through 257,
+# and refusing it rejects the WHOLE config — so one line meant for journald
+# stopped PM2, Docker and everything else from being collected. The unit exited
+# 78/CONFIG, systemd restarted it, and it exited again: forty-seven times on the
+# machine this was found on, while the app showed a collector that was merely
+# "restarting" and charts that were simply empty.
+#
+# Read from systemd rather than from `vector validate`, which cannot see it.
+# Validation checks the config's shape; the version check happens later, when
+# the source is built. On that machine `vector validate` said the config was
+# good, the doctor agreed, and vector then died on it every five seconds.
+#
+# Only that window is affected. A machine outside it keeps the option, so
+# nothing changes for the machines already collecting.
+journald_all_boots_supported() {
+  local v
+  v=$(systemd_version)
+  [ -n "$v" ] || return 0
+  [ "$v" -ge 250 ] && [ "$v" -le 257 ] && return 1
+  return 0
+}
+
 generate() {
   local tmp="$VECTOR_CONF.tmp"
   install -d -m 755 /etc/vector "$STATE/vector"
@@ -46,6 +77,26 @@ generate() {
 
   local services_json
   services_json=$(json_get "$CONF" logServices '[]')
+
+  # What PM2 calls the service behind each log path, for the paths where the
+  # filename does not say it. Empty on a default install, and an empty map
+  # leaves the parser below behaving exactly as it always has.
+  local pm2_name_map
+  pm2_name_map=$(pm2_log_info map)
+  [ -n "$pm2_name_map" ] || pm2_name_map='{}'
+
+  # Settable by the caller so the recovery in reload_vector can regenerate
+  # without the option after the collector has refused it in a way nothing here
+  # could predict.
+  local JOURNAL_ALL_BOOTS=${JOURNAL_ALL_BOOTS:-}
+  if [ -z "$JOURNAL_ALL_BOOTS" ]; then
+    JOURNAL_ALL_BOOTS=1
+    if [ "$src_systemd" = "True" ] && [ "${HAS_JOURNAL:-0}" = "1" ] \
+       && ! journald_all_boots_supported; then
+      JOURNAL_ALL_BOOTS=0
+      warn "systemd $(systemd_version) refuses current_boot_only=false — journald will cover the current boot only"
+    fi
+  fi
 
   {
     cat <<EOF
@@ -136,8 +187,17 @@ EOF
 
 [sources.systemd]
 type = "journald"
-current_boot_only = false
 EOF
+      if [ "${JOURNAL_ALL_BOOTS:-1}" = "1" ]; then
+        echo 'current_boot_only = false'
+      else
+        cat <<'EOF'
+# current_boot_only is left at its default: this vector refuses to set it to
+# false against this systemd, and refusing it rejects the entire config —
+# journald, PM2, Docker and all. Journal entries from before the last reboot are
+# the price; collecting nothing at all was the alternative.
+EOF
+      fi
     fi
 
     if [ "$src_nginx" != "off" ] && [ -n "${NGINX_LOG_DIR:-}" ]; then
@@ -174,10 +234,15 @@ PY
 [transforms.parse]
 type = "remap"
 inputs = $inputs
+source = '''
+  # Log path -> the name PM2 gives the process writing it, for the paths where
+  # the filename does not already say it. Written here rather than looked up at
+  # read time because VRL has no way to reach outside the config, and empty on
+  # every default install — an empty map leaves the naming below unchanged.
+  pm2_names = $pm2_name_map
 EOF
 
     cat <<'PARSE'
-source = '''
   raw = to_string(.message) ?? ""
 
   # ── strip terminal escapes ───────────────────────────────────────────────
@@ -225,7 +290,22 @@ source = '''
       # while its log kept growing — no error, no dropped-event count, every
       # health check green. A rotation is the one moment a log pipeline must not
       # be surprised by, and this one was.
-      .service = replace(base, r'-(out|error)(-\d+)?(__[^/]*)?\.log$', "")
+      stem = replace(path, r'-(out|error)(-\d+)?(__[^/]*)?\.log$', "")
+
+      # PM2's own name wins over the filename when the two disagree. An
+      # ecosystem file that sets out_file names the file after the deployment
+      # rather than after the process — /var/log/atria/prod-out.log for
+      # atria-mobility-ev-backend-prod — and the filename-derived name then
+      # matches nothing in the selected list, so every line of that service is
+      # read correctly and thrown away by the filter below. Nothing reports it:
+      # the collector is active, the config validates, the file is being
+      # written, and the service simply never appears.
+      named = get(pm2_names, [stem]) ?? null
+      if named != null {
+        .service = string!(named)
+      } else {
+        .service = replace(base, r'-(out|error)(-\d+)?(__[^/]*)?\.log$', "")
+      }
       .kind = "pm2"
       .stream = if match(path, r'-error') { "stderr" } else { "stdout" }
     }
@@ -505,20 +585,39 @@ reload_vector() {
   # project exists to prevent. Say so, and say where to look.
   if systemctl is-active --quiet vector; then
     log "vector running"
-  else
-    warn "vector is NOT running — no logs will be collected"
-    systemctl status vector --no-pager --lines=10 >&2 2>&1 || true
-    journalctl -u vector --no-pager --lines=20 >&2 2>&1 || true
-    return 1
+    return 0
   fi
+
+  # A config vector accepts at validate time can still be refused when it builds
+  # the topology, and journald's version check is exactly that: the config
+  # validates, the doctor reports it valid, and the unit then exits 78/CONFIG on
+  # every start. The rule above predicts the case that has been seen; this
+  # catches it however the rule is wrong, because a source that will not start
+  # takes every other source down with it.
+  if journalctl -u vector --no-pager --lines=50 2>/dev/null | grep -q 'current_boot_only'; then
+    warn "the collector refuses current_boot_only=false here — regenerating journald without it"
+    if JOURNAL_ALL_BOOTS=0 generate; then
+      systemctl restart vector >/dev/null 2>&1 || true
+      if systemctl is-active --quiet vector; then
+        log "vector running (journald limited to the current boot)"
+        return 0
+      fi
+    fi
+  fi
+
+  warn "vector is NOT running — no logs will be collected"
+  systemctl status vector --no-pager --lines=10 >&2 2>&1 || true
+  journalctl -u vector --no-pager --lines=20 >&2 2>&1 || true
+  return 1
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  # PM2 dirs are re-detected here so the CLI can regenerate without the installer.
+  # PM2 log locations are re-detected here, not read from the env file, so the
+  # CLI picks up a service whose log path changed since the install without one.
   dirs=""
-  for d in /root/.pm2/logs /home/*/.pm2/logs; do
-    [ -d "$d" ] && dirs="$dirs\"$d/*.log\", "
-  done
+  while IFS= read -r g; do
+    [ -n "$g" ] && dirs="$dirs\"$g\", "
+  done < <(pm2_log_info globs)
   export PM2_LOG_DIRS_CSV="${dirs%, }"
   [ -d /var/log/nginx ] && export NGINX_LOG_DIR=/var/log/nginx
   command -v journalctl >/dev/null 2>&1 && export HAS_JOURNAL=1

@@ -86,9 +86,16 @@ if systemctl cat vector >/dev/null 2>&1; then
   # "inactive\nunknown".
   STATE_V=$(systemctl is-active vector 2>/dev/null)
   STATE_V=${STATE_V:-unknown}
+  V_RESTARTS=$(systemctl show vector -p NRestarts --value 2>/dev/null || echo 0)
   if [ "$STATE_V" = "active" ]; then
     ok "state          active"
     info "running since  $(systemctl show vector -p ActiveEnterTimestamp --value 2>/dev/null)"
+  elif { [ "$STATE_V" = "activating" ] || [ "$STATE_V" = "failed" ]; }        && [ "${V_RESTARTS:-0}" -gt 5 ]; then
+    # "activating" with a restart count reads as a collector that is coming up.
+    # It is the opposite: systemd is restarting a unit that dies on every start,
+    # so nothing is collected from ANY source, and it will not fix itself. The
+    # reason is in the collector errors section at the bottom of this report.
+    bad "state          $STATE_V — crash-looping ($V_RESTARTS restarts). Nothing is being collected from any source."
   else
     bad "state          $STATE_V"
   fi
@@ -134,11 +141,18 @@ fi
 # ── 5. what there is to collect ──────────────────────────────────────────────
 head_ "sources on this machine"
 PM2_FILES=0
-for d in /root/.pm2/logs /home/*/.pm2/logs; do
+# Asked of pm2, not assumed to be ~/.pm2/logs. A service that sets out_file in
+# its ecosystem file writes somewhere else entirely, and the old listing showed
+# a directory holding nothing but pm2-logrotate's own logs while five services
+# were running — which reads as "this machine has no logs" and is not true.
+while IFS= read -r glob_pat; do
+  [ -n "$glob_pat" ] || continue
+  d=$(dirname "$glob_pat")
+  pat=$(basename "$glob_pat")
   [ -d "$d" ] || continue
-  n=$(find "$d" -name '*.log' -type f 2>/dev/null | wc -l)
+  n=$(find "$d" -maxdepth 1 -name "$pat" -type f 2>/dev/null | wc -l)
   PM2_FILES=$((PM2_FILES + n))
-  info "pm2 logs       $d  ($n files)"
+  info "pm2 logs       $glob_pat  ($n files)"
   # Recent writes matter more than file count: a directory full of logs nothing
   # writes to any more explains an empty log view with read_from = "end".
   #
@@ -147,7 +161,7 @@ for d in /root/.pm2/logs /home/*/.pm2/logs; do
   # arbitrary five of however many, while reading exactly like the complete
   # list. That is worse than showing nothing: it was used to conclude one
   # service was the only one writing, which the output could not support.
-  RECENT=$(find "$d" -name '*.log' -type f -mmin -10 -printf '%T@ %p\n' 2>/dev/null \
+  RECENT=$(find "$d" -maxdepth 1 -name "$pat" -type f -mmin -10 -printf '%T@ %p\n' 2>/dev/null \
            | sort -rn | cut -d' ' -f2-)
   RECENT_N=$(printf '%s' "$RECENT" | grep -c . || true)
   if [ "${RECENT_N:-0}" -eq 0 ]; then
@@ -157,7 +171,7 @@ for d in /root/.pm2/logs /home/*/.pm2/logs; do
       | sed 's/^/                 recently written: /'
     [ "$RECENT_N" -gt 8 ] && info "                 … and $((RECENT_N - 8)) more (newest first)"
   fi
-done
+done < <(pm2_log_info globs)
 [ "$PM2_FILES" -eq 0 ] && info "pm2 logs       none found"
 
 if docker info >/dev/null 2>&1; then
@@ -499,6 +513,10 @@ PY
   # section listed one service out of six while looking complete.
   mapfile -t SELECTED < <(printf '%s\n' "$SERVICES_LIST")
 
+  # <mtime>\t<size>\t<service>\t<path>, newest first, for every pm2 log on the
+  # machine — built once for the whole loop below.
+  PM2_INDEX=$(pm2_log_info files)
+
   for svc in "${SELECTED[@]}"; do
     [ -n "$svc" ] || continue
 
@@ -513,12 +531,19 @@ PY
                    WHERE service = '$esc' AND ts > now() - interval '1 hour';" \
                  </dev/null 2>/dev/null || echo 0)
 
-    newest=$(find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f \
-               \( -name "$svc-out*.log" -o -name "$svc-error*.log" -o -name "$svc.log" \) \
-               -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -1)
+    # Looked up by the service pm2 says owns the file, not by a filename built
+    # from the service name: a log named after the deployment rather than after
+    # the process matches no such pattern, and this reported "no log file" for a
+    # service whose log was being written to every second.
+    newest=$(printf '%s\n' "$PM2_INDEX" \
+             | awk -F'\t' -v s="$svc" '$3 == s { print $1" "$2" "$4; exit }')
 
     if [ -n "$newest" ]; then
-      mtime=${newest%%.*}
+      # Fields, not a suffix strip. The mtime used to arrive from find as
+      # 1787116529.1234567 and `${newest%%.*}` cut it at the dot; the index
+      # gives whole seconds, so that same strip would cut the path at .log
+      # instead and hand a filename to the arithmetic below.
+      mtime=$(printf '%s' "$newest" | awk '{print $1}')
       size=$(printf '%s' "$newest" | awk '{print $2}')
       age=$(( NOW_EPOCH - mtime ))
       if   [ "$age" -lt 120 ]   ; then when="${age}s ago"
@@ -554,7 +579,7 @@ PY
     elif docker ps --format '{{.Names}}' 2>/dev/null | grep -qxF "$svc"; then
       detail="docker container — logs come from the docker socket, not a file"
     else
-      detail="NO log file matching $svc-*.log — check the pm2 process name"
+      detail="pm2 reports no log file for this service — check the process name, or whether its output goes to /dev/null"
     fi
 
     printf '                 %-32s %6s rows   %s\n' "$svc" "${rows:-0}" "$detail"
@@ -573,9 +598,8 @@ PY
   # stdin with the program — so anything piped in is discarded and the block
   # reports "nothing" while a file is being written under its nose. That is
   # exactly what the first release of this check did.
-  LIVE_FILES=$(find /root/.pm2/logs /home/*/.pm2/logs -maxdepth 1 -type f \
-                 -name '*.log' -mmin -10 -printf '%p\n' 2>/dev/null || true)
-  python3 - "$SERVICES_LIST" "$LIVE_FILES" "$STATE/vector" <<'PY'
+  LIVE_FILES=$(pm2_find_logs -mmin -10 -printf '%p\n')
+  python3 - "$SERVICES_LIST" "$LIVE_FILES" "$STATE/vector" "$(pm2_log_info map)" <<'PY'
 import json, os, re, sys
 
 # Identical to the parser's regex in lib/vector-config.sh. The trailing group is
@@ -585,6 +609,18 @@ NAME = re.compile(r'-(out|error)(-\d+)?(__[^/]*)?\.log$')
 selected = {s.strip() for s in sys.argv[1].splitlines() if s.strip()}
 files = [ln.strip() for ln in sys.argv[2].splitlines() if ln.strip()]
 state = sys.argv[3]
+
+# The same map the parser is given: pm2's own name for a log path, used wherever
+# the filename does not carry it. Without this the table below shows the name
+# derived from the filename, which is precisely the name that is wrong.
+try:
+    name_map = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+except ValueError:
+    name_map = {}
+
+
+def service_of(path):
+    return name_map.get(NAME.sub('', path)) or NAME.sub('', os.path.basename(path))
 
 if not files:
     print("                 no pm2 log file has been written in the last 10 minutes")
@@ -610,7 +646,7 @@ for root, _dirs, names in os.walk(state):
 
 dropped = stalled = 0
 for path in sorted(files):
-    derived = NAME.sub('', os.path.basename(path))
+    derived = service_of(path)
     keep = derived in selected
 
     try:
@@ -880,6 +916,17 @@ else
   if [ -n "$V_ERRS" ]; then
     bad "the running collector is logging errors:"
     printf '%s\n' "$V_ERRS" | sed 's/^/          /'
+    # Said plainly, because the section above will have reported the same config
+    # as valid. `vector validate` checks the config's shape; a source's own
+    # startup checks — journald against the systemd version is the one seen so
+    # far — run later, when the topology is built. A config can therefore pass
+    # every check in this report and still kill the collector on every start.
+    if printf '%s\n' "$V_ERRS" | grep -q 'Configuration error'; then
+      bad "the collector rejects its config at STARTUP, so nothing is collected"
+      info "               from any source — pm2 and docker included. 'vector validate'"
+      info "               does not run these checks, which is why the config section"
+      info "               above can pass while this fails."
+    fi
   else
     ok "no errors since $SINCE"
   fi

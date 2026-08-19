@@ -90,6 +90,16 @@ db_running = container in sh("docker ps --format '{{.Names}}'").splitlines()
 # say "not running" and the operator has to SSH in to learn anything — which is
 # the workflow this whole agent exists to remove.
 vector_state = sh("systemctl is-active vector") or "unknown"
+
+# A collector that dies on every start spends most of its life in "activating",
+# which reads as a collector that is coming up. The restart count is what tells
+# the two apart, and without it the app called a crash loop a restart and told
+# the reader to wait for it to clear — for as long as they were willing to wait.
+try:
+    vector_restarts = int(sh("systemctl show vector -p NRestarts --value") or 0)
+except ValueError:
+    vector_restarts = 0
+
 collector_detail = ""
 if vector_state != "active":
     # Order matters: check the config BEFORE the unit. A config that failed
@@ -127,6 +137,7 @@ print(json.dumps({
     "discovered": discovered,
     "collector": {
         "state": vector_state,
+        "restarts": vector_restarts,
         "detail": collector_detail[:2000],
     },
     "health": {
